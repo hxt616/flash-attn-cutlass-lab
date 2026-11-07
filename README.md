@@ -26,11 +26,11 @@ a PyTorch extension, a pytest matrix, benchmarks, and documentation.
   m_block)` map, and all sequences' Q tiles share one grid. No per-sequence
   launch and no `cu_seqlens` device-to-host copy.
 - Paged-KV decode: `flash_attn_with_kvcache`-style API with `block_table`,
-  `cache_seqlens`, GQA and page sizes 64/128/256. The kernel reads K/V tiles
-  directly from paged cache (no gather into a contiguous buffer).
+  `cache_seqlens`, GQA and page sizes 64/128/256. K/V tiles are read directly
+  from paged cache (no gather), with split-KV + a log-sum-exp combine kernel.
 - PyTorch extension that launches on the current CUDA stream, returns
   `(out, lse)`, and validates dtype/shape/contiguity.
-- 231 pytest cases (shapes, causal, GQA, varlen, decode/paged KV, bf16, edge
+- 233 pytest cases (shapes, causal, GQA, varlen, decode/paged KV, bf16, edge
   cases, API contracts, and an official-style error-vs-PyTorch criterion).
 - Reproducible benchmark harness with CSV/PNG output and SDPA/official
   comparisons.
@@ -122,7 +122,7 @@ Reference: an independent, easy-to-audit CUDA kernel
 - official-style check: `our_error <= 2 * pytorch_error + 1e-3`
 
 ```text
-231 passed
+233 passed
 ```
 
 Run `make sanitize` to exercise small ragged shapes under
@@ -186,22 +186,22 @@ nano-vllm Python 3.12 environment (`torch 2.6.0+cu124`, official
 `flash_attn 2.8.3`). Raw data:
 `benchmarks/results/bench_vs_official.csv`.
 
-**Paged-KV decode** (bf16, `H=16, Hk=8, D=128`, page size 256, no split-KV)
+**Paged-KV decode** (bf16, `H=16, Hk=8, D=128`, page size 256, split-KV auto)
 
-| B | context | ours ms | official ms | speed vs official |
-|---:|---:|---:|---:|---:|
-| 1 | 512 | 0.0256 | 0.0184 | 0.72× |
-| 1 | 2048 | 0.0888 | 0.0350 | 0.39× |
-| 1 | 4096 | 0.1727 | 0.0587 | 0.34× |
-| 8 | 512 | 0.1054 | 0.0552 | 0.52× |
-| 8 | 2048 | 0.3950 | 0.2102 | 0.53× |
-| 8 | 4096 | 0.6970 | 0.4050 | 0.58× |
+| B | context | auto splits | ours ms | official ms | speed vs official |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 512 | 3 | 0.0239 | 0.0181 | 0.76× |
+| 1 | 2048 | 3 | 0.0581 | 0.0352 | 0.61× |
+| 1 | 4096 | 3 | 0.1058 | 0.0589 | 0.56× |
+| 8 | 512 | 2 | 0.1105 | 0.0553 | 0.50× |
+| 8 | 2048 | 2 | 0.3765 | 0.2069 | 0.55× |
+| 8 | 4096 | 2 | 0.7286 | 0.3946 | 0.54× |
 
-Correctness matches official within ~1e-3. This is a **first paged-decode
-version**: K/V are read directly through `block_table`, but it uses one CTA per
-`(batch, head)` and the same 64-row Q tile as prefill. Official uses split-KV
-and a decode-specific schedule, so our latency is 0.34–0.72× official. Split-KV
-+ combine is the next optimization; raw data:
+Correctness matches official within ~1e-3. Split-KV + combine is implemented:
+each CTA handles a contiguous KV range, writes partial `O/lse`, and a combine
+kernel merges them. Decode is now 0.50–0.76× official; the remaining gap is the
+64-row Q tile (only one row is valid), single-stage `cp.async`, GQA duplicate
+K/V reads, and official's more mature decode schedule. Raw data:
 `benchmarks/results/bench_decode.csv`.
 
 ## What I changed vs upstream
@@ -223,8 +223,9 @@ See [`CONTRIBUTIONS.md`](CONTRIBUTIONS.md). Highlights:
 - SM80/SM89 path only; no Hopper TMA/wgmma or warp specialization.
 - Varlen uses a static fused grid with an atomic device-side tile map; a
   persistent work-queue scheduler would further reduce the causal tail.
-- Decode is a first paged-KV version: no split-KV/combine yet, and it uses the
-  64-row prefill Q tile; this is why decode is 0.34–0.72× official.
+- Decode now uses split-KV + combine (auto heuristic; `num_splits` can be
+  overridden), but still reuses the 64-row prefill Q tile and single-stage
+  pipeline; this is why decode is 0.50–0.76× official.
 - Prefill does not yet support `block_table`/prefix-cache indexing; only the
   no-prefix-cache prefill path is supported. Decode does support `block_table`.
 - Single-stage `cp.async` pipeline (K/V loads overlap the QK GEMM, but there is

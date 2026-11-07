@@ -178,9 +178,10 @@ block_table:(B, max_pages)      # logical page -> physical page
 cache_seqlens:(B,)              # valid KV length
 ```
 
-The decode kernel launches `grid = (1, B*H)` and reuses
-`flash_attention_v2_body` with `Is_causal=false` (the cache contains only past
-tokens). The body's K/V tile loader computes the physical address directly:
+Decode starts from `flash_attention_decode_kernel` with
+`grid = (1, B*H)` and reuses `flash_attention_v2_body` with
+`Is_causal=false` (the cache contains only past tokens). The body's K/V tile
+loader computes the physical address directly:
 
 ```text
 logical   = nbi * kBlockN
@@ -193,10 +194,23 @@ k_tile    = k_cache + physical * page_stride + page_off * row_stride
 So there is no gather into a contiguous KV buffer. The host API checks
 `page_block_size % 64 == 0` so a 64/128-wide KV tile never crosses a page.
 
-The first version uses one CTA per `(batch, head)` and the same 64-row Q tile as
-prefill; Q row 0 is the only valid row. It reaches 0.34–0.72× official
-`flash_attn_with_kvcache` because official also split-KVs the cache across CTAs
-and uses a decode-specific schedule. Split-KV + combine is the next step.
+When `num_splits > 1` (the default auto heuristic), the kernel launches
+`grid = (num_splits, B*H)`. Each CTA handles a contiguous KV block range
+`[n_block_min, n_block_max)`, writes a partial `O` (normalized by its split's
+`l`) and a partial `lse` to a workspace, and a combine kernel merges them:
+
+```text
+m = max(lse_s)
+l = sum(exp(lse_s - m))
+O = sum(exp(lse_s - m) * O_s) / l
+lse = m + log(l)
+```
+
+The auto heuristic targets more splits when `B*H` is small. Decode now measures
+0.50–0.76× official `flash_attn_with_kvcache`; it still reuses the 64-row
+prefill Q tile (only one row is valid), has a single-stage `cp.async` pipeline,
+and does not share K/V reads across query heads in a GQA group. Those are the
+next decode optimizations.
 
 ## 9. Code map
 

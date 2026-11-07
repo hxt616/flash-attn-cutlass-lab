@@ -83,21 +83,21 @@ Interpretation:
 
 ## Paged-KV decode
 
-Decode is a first version: one CTA per `(batch, head)`, 64-row Q tile, K/V
-tiles addressed directly through `block_table`. It is correct but has no
-split-KV, so it does not fill the GPU when `B*H` is small.
+Decode addresses K/V tiles directly through `block_table` and now uses
+split-KV + a log-sum-exp combine kernel. The auto heuristic picks 3 splits for
+`B*H=16` and 2 for `B*H=128`; `num_splits` can be overridden.
 
 Environment: same bf16/Qwen3 shape (`H=16, Hk=8, D=128`), page size 256,
 `torch 2.6.0+cu124`, official `flash_attn 2.8.3`.
 
-| B | context | ours ms | official ms | speed |
-|---:|---:|---:|---:|---:|
-| 1 | 512 | 0.0256 | 0.0184 | 0.72× |
-| 1 | 2048 | 0.0888 | 0.0350 | 0.39× |
-| 1 | 4096 | 0.1727 | 0.0587 | 0.34× |
-| 8 | 512 | 0.1054 | 0.0552 | 0.52× |
-| 8 | 2048 | 0.3950 | 0.2102 | 0.53× |
-| 8 | 4096 | 0.6970 | 0.4050 | 0.58× |
+| B | context | auto splits | ours ms | official ms | speed |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 512 | 3 | 0.0239 | 0.0181 | 0.76× |
+| 1 | 2048 | 3 | 0.0581 | 0.0352 | 0.61× |
+| 1 | 4096 | 3 | 0.1058 | 0.0589 | 0.56× |
+| 8 | 512 | 2 | 0.1105 | 0.0553 | 0.50× |
+| 8 | 2048 | 2 | 0.3765 | 0.2069 | 0.55× |
+| 8 | 4096 | 2 | 0.7286 | 0.3946 | 0.54× |
 
 Raw data: `benchmarks/results/bench_decode.csv`; script:
 `benchmarks/bench_decode.py`.
@@ -105,9 +105,10 @@ Raw data: `benchmarks/results/bench_decode.csv`; script:
 For a code-level explanation of every gap (prefill, varlen, decode), see
 [`performance-gap-analysis-zh.md`](performance-gap-analysis-zh.md).
 
-Next steps: split the KV range across CTAs, write partial O/lse, then combine
-with a log-sum-exp kernel. Also use a smaller Q tile (1/16 rows) for decode so
-the tensor-core work matches the one valid query row.
+Remaining decode work: a smaller Q tile (1/16 rows) so tensor-core work matches
+the one valid query row, a multi-stage `cp.async` pipeline, and possibly sharing
+K/V reads across the query heads in a GQA group. Official still has a more
+mature decode schedule.
 
 ## Bottleneck hypotheses
 

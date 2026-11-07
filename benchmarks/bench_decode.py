@@ -68,6 +68,7 @@ def main():
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--num-splits", type=int, default=0)
     parser.add_argument("--out", default="benchmarks/results/bench_decode.csv")
     args = parser.parse_args()
 
@@ -85,7 +86,8 @@ def main():
             scale = 1.0 / math.sqrt(args.dim)
 
             out_ours, _ = flash_attn_lab.flash_attn_with_kvcache(
-                q, k_cache, v_cache, block_table, cache_seqlens, scale
+                q, k_cache, v_cache, block_table, cache_seqlens, scale,
+                args.num_splits,
             )
             if HAS_OFFICIAL:
                 out_off = flash_attn_with_kvcache(
@@ -94,6 +96,7 @@ def main():
                     block_table=block_table,
                     softmax_scale=scale,
                     causal=True,
+                    num_splits=args.num_splits,
                 )
                 err = (out_ours.float() - out_off.float()).abs().max().item()
             else:
@@ -101,7 +104,8 @@ def main():
 
             t_ours = time_ms(
                 lambda: flash_attn_lab.flash_attn_with_kvcache(
-                    q, k_cache, v_cache, block_table, cache_seqlens, scale
+                    q, k_cache, v_cache, block_table, cache_seqlens, scale,
+                    args.num_splits,
                 ),
                 args.warmup, args.iters, args.repeats,
             )
@@ -113,6 +117,7 @@ def main():
                         block_table=block_table,
                         softmax_scale=scale,
                         causal=True,
+                        num_splits=args.num_splits,
                     ),
                     args.warmup, args.iters, args.repeats,
                 )
@@ -122,7 +127,7 @@ def main():
             row = dict(
                 B=B, context=context, page_size=args.page_size,
                 H=args.heads, Hk=args.headsk, D=args.dim,
-                dtype=args.dtype,
+                dtype=args.dtype, num_splits=args.num_splits,
                 ours_ms=t_ours, official_ms=t_off,
                 ours_tok_s=B / (t_ours * 1e-3),
                 official_tok_s=B / (t_off * 1e-3),

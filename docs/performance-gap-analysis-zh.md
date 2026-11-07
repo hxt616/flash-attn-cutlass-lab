@@ -13,13 +13,13 @@
 | 固定长度 prefill | 官方 FA2 的 **0.93–1.06×** | 数学和 tiling 与 FA2 基本一致;形状足够大时是 compute-bound,差距主要来自单级 cp.async、固定 block 配置、缺少 warp specialization |
 | fused varlen | 官方 FA2 的 **0.92–0.96×**(混合长度) | 已从 host 循环改为单 grid + device tile map;剩余差距来自静态 tile 顺序、causal 尾部、额外 CTA |
 | 很多短序列 varlen | 官方 FA2 的 **0.86–0.88×** | 每条序列 q tile 少,GPU 占用不足;上界 grid 会多 launch 一些空 CTA;静态调度不能按工作量排序 |
-| paged-KV decode | 官方 `flash_attn_with_kvcache` 的 **0.34–0.72×** | 没有 split-KV/combine,一个 CTA 串行扫完整 KV;`B*H` 小时并行度不足;单级流水线;Q tile 复用 prefill 的 64 行 |
+| paged-KV decode | 官方 `flash_attn_with_kvcache` 的 **0.50–0.76×** | split-KV/combine 已实现;剩余差距是 Q tile 复用 prefill 的 64 行、单级流水线、GQA 重复读 K/V、官方更成熟的 decode 调度 |
 
 一句话:
 
 - **prefill 已经接近官方,说明 FA2 主体和 CuTe 映射是对的;**
 - **varlen 的剩余差距是“调度/尾部”,不是数学;**
-- **decode 的差距是“并行度和 split-KV”,不是 paged 寻址本身。**
+- **decode 的差距已经从“没有 split-KV”缩小到“Q tile/流水线/GQA 读取”这些第二层问题;**
 
 ---
 
@@ -134,7 +134,7 @@ for b in sequences:
 
 ---
 
-## 4. Paged-KV decode:为什么只有 0.34–0.72×
+## 4. Paged-KV decode:为什么是 0.50–0.76×
 
 Decode 的语义:
 
@@ -147,35 +147,49 @@ cache_seqlens:(B,)            有效 KV 长度
 
 当前实现:
 
-- `flash_attention_decode_kernel` grid = `(1, B*H)`;
-- 每个 CTA 负责一个 `(batch, head)`,串行遍历所有 KV block;
+- `num_splits == 1` 时用 `flash_attention_decode_kernel`,grid = `(1, B*H)`;
+- `num_splits > 1` 时用 `flash_attention_decode_split_kernel`,grid = `(num_splits, B*H)`;
+  每个 CTA 处理一段 KV block,写 partial `O/lse`;
+- `combine_decode_kernel` 用 log-sum-exp 合并 partials;
 - K/V tile 通过 `block_table` 直接算物理地址,不 gather;
 - 复用 `flash_attention_v2_body`,Q tile 仍是 64 行,只有第 0 行有效。
 
-### 4.1 并行度不足(最主要)
+自动 split 规则(在 host 上,根据 `B*H`):
 
-- `B=1, H=16` 时只有 **16 个 CTA**,RTX 4060 Laptop 约 24 个 SM,GPU 都填不满;
-- `B=8, H=16` 时 128 个 CTA,情况好一些,但每个 CTA 仍然串行扫完整 KV;
-- 官方 `flash_attn_with_kvcache` 使用 **split-KV**:把 KV 长度切成多个 split,
-  grid 变成 `(num_splits, B*H)`,再用 combine kernel 合并部分 `O/lse`。
+```text
+target = (B*H < 64) ? 48 : 192
+num_splits = clamp(ceil(target / (B*H)), 1, 8)
+```
 
-所以 decode 的关键不是“页表寻址慢”,而是 **KV 维度的并行度不够**。
+例如 `B=1,H=16` 用 3 split,`B=8,H=16` 用 2 split。
 
-### 4.2 每个 CTA 串行扫 KV,延迟被拉长
+### 4.1 split-KV 已经带来的提升
 
-- 当前 CTA 的关键路径是 `O(context_len/kBlockN)` 次循环;
-- context 越长,单个 CTA 越久,尾部越明显;
-- 实测带宽:
-  - 我们:约 82–193 GB/s
-  - 官方:约 114–331 GB/s
-- 这不是因为 HBM 不够快,而是没有足够的并发请求去填满内存系统。
+| B | context | 改前(no split) | 改后(auto split) |
+|---:|---:|---:|---:|
+| 1 | 512 | 0.72× | 0.76× |
+| 1 | 2048 | 0.39× | 0.61× |
+| 1 | 4096 | 0.34× | 0.56× |
+| 8 | 512 | 0.52× | 0.50× |
+| 8 | 2048 | 0.53× | 0.55× |
+| 8 | 4096 | 0.58× | 0.54× |
+
+B=1 的长 context 提升最明显,因为原来只有 16 个 CTA;split 后变成
+`3 × 16 = 48` 个 CTA,GPU 能填得更满。B=8 本来就有 128 个 CTA,split 的
+收益小,combine 还有固定开销,所以 512/4096 出现小幅回退或波动。
+
+### 4.2 剩余差距:并行度仍然不够“满”
+
+- 当前 auto 只到 3/2 split,官方可能用更多 split 或更细的调度;
+- split 后带宽约 76–206 GB/s,官方约 116–340 GB/s;
+- 这不是 HBM 不够快,而是并发请求、Q tile 浪费和单级流水线共同限制。
 
 ### 4.3 Q tile 复用 prefill 的 64 行
 
 - decode 只有 1 个 query,q tile 的 63 行是无效的;
 - tensor-core 和 smem 仍有 64 行的开销;
 - 注意:官方 splitkv dispatch 也用 `kBlockM=64`,所以**这不是和官方差距的唯一原因**;
-  但“decode 专用小 Q tile(1/16)”仍是值得尝试的优化,需要配合 split-KV 一起看。
+  但“decode 专用小 Q tile(1/16)”仍是值得尝试的优化,需要和 split-KV 一起看。
 
 ### 4.4 单级 `cp.async` 流水线
 
@@ -195,12 +209,17 @@ cache_seqlens:(B,)            有效 KV 长度
 - L2 会帮助缓存,但指令/请求仍然重复;
 - 进一步可以尝试“一个 CTA 处理同一 KV head 下的多个 Q head”,减少 K/V 读取。
 
-### 4.7 短 kernel 的 launch/分配开销
+### 4.7 combine 与短 kernel 的固定开销
 
-- decode 单次只有几十微秒,`torch::empty`、kernel launch、combine 等固定开销占比高;
-- 官方也分配输出,但 split-KV 和调度更成熟;
-- 这也是 B=1、context=512 时比值 0.72,而 context=4096 掉到 0.34 的原因:
-  长 context 下并行度不足的问题被放大。
+- split 后多了一个 combine kernel 和 partial workspace 分配;
+- decode 单次只有几十微秒,这些固定开销占比高;
+- 这也是 B=8 短 context 时 split 收益不明显、甚至略回退的原因。
+
+### 4.8 官方仍有更成熟的 decode 调度
+
+- 官方的 split 数、combine、Q tile 和流水线是一起调的;
+- 我们的 auto heuristic 只是简单按 `B*H` 选 split,没有看 context 长度;
+- 下一步可以根据 `cache_seqlens` 或 profiler 结果做更细的 split 选择。
 
 ---
 
@@ -232,18 +251,19 @@ cache_seqlens:(B,)            有效 KV 长度
 
 ## 6. 下一步优化及预期
 
-### P0:decode split-KV + combine
+### P0(已完成):decode split-KV + combine
 
-- 把 KV 长度切成 `num_splits`,每个 CTA 处理一段;
-- 写 partial `O/lse` 到 workspace;
-- combine kernel 用 log-sum-exp 合并;
-- 预期:decode 带宽从 82–193 GB/s 提升到接近官方;B=1 的长 context 提升最明显。
-- 验收:正确性对齐;paged 边界/sanitizer;`bench_decode.py` 比值提升。
+- `flash_attention_decode_split_kernel` 把 KV 长度切成 `num_splits`,每个 CTA
+  处理一段,写 partial `O/lse`;
+- `combine_decode_kernel` 用 log-sum-exp 合并;
+- auto heuristic 按 `B*H` 选 3/2 split,`num_splits` 可覆盖;
+- 结果:decode 从 0.34–0.72× 提升到 **0.50–0.76×**,B=1 长 context 提升最明显。
 
-### P1:decode 专用小 Q tile
+### P0:decode 专用小 Q tile
 
 - 尝试 `kBlockM=1/16` 的 decode body,减少无效 tensor-core/smem 开销;
-- 需要和 split-KV 一起评估,因为官方 splitkv 也用 64 行 tile。
+- 需要和 split-KV 一起评估,因为官方 splitkv 也用 64 行 tile;
+- 这是目前 decode 最值得做的下一步。
 
 ### P1:双缓冲 K/V 流水线
 
@@ -307,10 +327,11 @@ prefill 足够大时是 compute-bound;我们的差距主要是单级 cp.async �
 答:旧版是 per-sequence launch + D2H;现在改成 device tile map + 单 grid,已经到
 0.92–0.96×。剩余是静态 tile 顺序和 causal 尾部,下一步 persistent/排序。
 
-**问:为什么 decode 慢?**
+**问:为什么 decode 还慢?**
 
-答:decode 的瓶颈是 KV 并行度。当前一个 CTA 串行扫完整个 KV,`B*H` 小的时候
-GPU 填不满;官方用 split-KV + combine。paged 寻址本身不是主要瓶颈。
+答:decode 已经实现 split-KV + combine,从 0.34–0.72× 提升到 0.50–0.76×。
+剩余差距是 Q tile 复用 prefill 的 64 行(只有 1 行有效)、单级 cp.async、
+GQA 重复读 K/V,以及官方更成熟的 decode 调度;paged 寻址本身不是主要瓶颈。
 
 **问:官方都有了,为什么还做这个?**
 
@@ -324,6 +345,6 @@ GPU 填不满;官方用 split-KV + combine。paged 寻址本身不是主要瓶�
 - 只做 forward;没有 backward/dropout/ALiBi/window。
 - sm80/89;没有 Hopper TMA/WGMMA/FA3。
 - prefill 暂不支持 `block_table`/prefix cache;decode 支持 `block_table`。
-- decode 没有 split-KV/combine,也没有专用小 Q tile。
+- decode 已支持 split-KV/combine,但还没有专用小 Q tile 和多 stage 流水线。
 - varlen 是静态 fused grid,不是 persistent work queue。
 - 只支持 contiguous 输入;head dim 必须是 32 的倍数且 <= 256。

@@ -49,9 +49,9 @@ work can be discussed honestly in interviews.
   everything else uses 64.
 - Added a paged-KV decode kernel and `flash_attn_with_kvcache`-style API. K/V
   tiles are addressed through `block_table` (no gather into a contiguous
-  buffer), with GQA and page sizes 64/128/256. The first version uses one CTA
-  per `(batch, head)` and measures 0.34–0.72× official `flash_attn_with_kvcache`;
-  split-KV + combine is the next optimization.
+  buffer), with GQA and page sizes 64/128/256. Decode uses split-KV + a
+  log-sum-exp combine kernel with an auto heuristic (`num_splits` override
+  available), and measures 0.50–0.76× official `flash_attn_with_kvcache`.
 
 ### PyTorch integration
 
@@ -75,7 +75,7 @@ work can be discussed honestly in interviews.
 
 ### Tests and docs
 
-- 231 pytest cases: shape matrix, causal, custom scale, LSE, GQA, varlen,
+- 233 pytest cases: shape matrix, causal, custom scale, LSE, GQA, varlen,
   zero-length sequences, bf16, API rejection tests, and an
   error-vs-PyTorch criterion (`our_error <= 2 * torch_error + 1e-3`).
 - `compute-sanitizer` script for ragged shapes.
@@ -84,8 +84,9 @@ work can be discussed honestly in interviews.
 ## Not implemented (deliberately out of scope)
 
 - Backward pass, dropout, ALiBi/RoPE/window masks.
-- Decode split-KV/combine and a decode-specific small-Q-tile schedule (the
-  current paged decode is correct but uses one CTA per head).
+- A decode-specific small-Q-tile schedule and a multi-stage decode pipeline;
+  the current paged decode is correct and split-KV, but reuses the 64-row
+  prefill Q tile.
 - A persistent/dynamic-work-queue varlen scheduler (the current fused varlen
   uses a static atomic tile map); prefill `block_table` / prefix-cache
   indexing.
