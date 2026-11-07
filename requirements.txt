@@ -1,0 +1,10 @@
+# Runtime/test requirements. The CUDA-enabled torch wheel is installed by
+# scripts/setup_env.sh; torch is intentionally not pinned here to avoid pulling
+# a CPU-only wheel.
+torch>=2.1
+pytest>=8
+numpy
+matplotlib
+pandas
+ninja
+packaging

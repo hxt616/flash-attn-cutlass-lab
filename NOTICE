@@ -1,0 +1,35 @@
+This project is a derivative work built for learning and portfolio purposes.
+It is not affiliated with NVIDIA or the FlashAttention authors.
+
+Upstream skeleton
+-----------------
+tiny-flash-attention
+  Copyright (c) 2024 66RING
+  MIT License
+  https://github.com/66RING/tiny-flash-attention
+  The CuTe FlashAttention-2 skeleton, kernel_traits.h, utils.h, and the
+  tutorial documents in docs/ originate from this project.
+
+CUTLASS / CuTe
+--------------
+Copyright (c) 2017-2024 NVIDIA Corporation
+BSD 3-Clause License
+https://github.com/NVIDIA/cutlass
+  Used as a pinned submodule/checkout (v3.4.x) for CuTe layouts, MMA atoms,
+  copy atoms, and the SM80 pipeline primitives.
+
+FlashAttention
+--------------
+Copyright (c) 2023, Tri Dao
+BSD 3-Clause License
+https://github.com/Dao-AILab/flash-attention
+  The online-softmax formulation, causal-mask indexing pattern, and the
+  predicated gmem->smem copy structure are adapted from the FlashAttention
+  reference implementation and its forward kernel. Full license text:
+  LICENSES/FlashAttention.txt and LICENSES/CUTLASS.txt.
+
+My changes
+----------
+See CONTRIBUTIONS.md. Files under csrc/, tests/, benchmarks/, scripts/, and the
+design/tuning/debugging/interview docs were written or substantially rewritten
+for this repository.

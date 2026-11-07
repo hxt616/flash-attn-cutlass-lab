@@ -1,0 +1,11 @@
+# Build requirements are intentionally minimal: this project is built against
+# the user's already-installed CUDA-enabled PyTorch. Use:
+#   pip install -e . --no-build-isolation
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["cuda: requires a CUDA device"]
+addopts = "-ra"
