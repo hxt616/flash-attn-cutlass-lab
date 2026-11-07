@@ -344,7 +344,8 @@ __device__ void flash_attention_v2_body(const Params& params,
 
   Tensor gQ = local_tile(Q, tile_m, make_coord(m_block, _));
   Tensor gK = make_tensor(
-      make_gmem_ptr(kv_tile_ptr(k_ptr, 0, params.k_row_stride,
+      make_gmem_ptr(kv_tile_ptr(k_ptr, params.n_block_min,
+                                params.k_row_stride,
                                 params.k_batch_stride)),
       Shape<Int<kBlockN>, Int<kHeadDim>>{},
       make_stride(params.k_row_stride, Int<1>{}));
@@ -416,7 +417,8 @@ __device__ void flash_attention_v2_body(const Params& params,
     copy_mn_elementwise</*Clear=*/true>(tQgQ, tQsQ, tQcQ, m_remaining);
   }
 
-  const int k_remaining_0 = params.k_seqlen;
+  const int k_remaining_0 =
+      params.k_seqlen - params.n_block_min * kBlockN;
   if (k_remaining_0 >= kBlockN) {
     copy_mn</*Is_even_MN=*/true, /*Clear=*/false>(
         gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, 0);
@@ -432,11 +434,15 @@ __device__ void flash_attention_v2_body(const Params& params,
       tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
   clear(rAccOut);
 
-  const int n_block_max =
-      Is_causal
-          ? min(cute::ceil_div(params.k_seqlen, kBlockN),
-                cute::ceil_div((m_block + 1) * kBlockM, kBlockN))
-          : cute::ceil_div(params.k_seqlen, kBlockN);
+  const int n_block_min = params.n_block_min;
+  int n_block_max = params.n_block_max;
+  if (n_block_max <= 0) {
+    n_block_max =
+        Is_causal
+            ? min(cute::ceil_div(params.k_seqlen, kBlockN),
+                  cute::ceil_div((m_block + 1) * kBlockM, kBlockN))
+            : cute::ceil_div(params.k_seqlen, kBlockN);
+  }
 
   Tensor scores_max =
       make_tensor<ElementAccum>(Shape<Int<2 * size<1>(rAccOut)>>{});
@@ -444,7 +450,7 @@ __device__ void flash_attention_v2_body(const Params& params,
 
   const float scale_log2 = params.softmax_scale * float(M_LOG2E);
 
-  for (int nbi = 0; nbi < n_block_max; ++nbi) {
+  for (int nbi = n_block_min; nbi < n_block_max; ++nbi) {
     auto rAccScore = partition_fragment_C(
         tiled_mma, make_shape(Int<kBlockM>{}, Int<kBlockN>{}));
     clear(rAccScore);
@@ -505,7 +511,7 @@ __device__ void flash_attention_v2_body(const Params& params,
       cute::cp_async_fence();
     }
 
-    if (nbi == 0) {
+    if (nbi == n_block_min) {
       softmax_rescale_o</*Is_first=*/true>(scores, scores_max, scores_sum,
                                           rAccOut, scale_log2);
     } else {
@@ -744,6 +750,103 @@ __global__ void flash_attention_decode_kernel(const Params params) {
 
   flash_attention_v2_body<Kernel_traits, /*Is_causal=*/false>(
       s_params, /*m_block=*/0, /*bidb=*/0, /*qh=*/0, /*kvh=*/0);
+}
+
+// ---------------------------------------------------------------------------
+// Split-KV decode: each CTA handles a contiguous range of KV blocks and writes
+// partial O/lse. grid = (num_splits, batch * q_head).
+// ---------------------------------------------------------------------------
+template <typename Kernel_traits, typename Params>
+__global__ void flash_attention_decode_split_kernel(const Params params) {
+  using Element = typename Kernel_traits::Element;
+  constexpr int kBlockN = Kernel_traits::kBlockN;
+
+  const int split = blockIdx.x;
+  const int bhid = blockIdx.y;
+  const int bidb = bhid / params.q_head;
+  const int qh = bhid - bidb * params.q_head;
+  const int cache_len = params.cache_seqlens[bidb];
+  if (cache_len <= 0) return;
+
+  const int total_blocks = (cache_len + kBlockN - 1) / kBlockN;
+  const int blocks_per_split =
+      (total_blocks + params.num_splits - 1) / params.num_splits;
+  const int n0 = split * blocks_per_split;
+  const int n1 = min(n0 + blocks_per_split, total_blocks);
+  if (n0 >= n1) return;
+
+  const int kvh = qh / (params.q_head / params.k_head);
+
+  __shared__ Params s_params;
+  if (threadIdx.x == 0) {
+    s_params = params;
+    s_params.q_ptr = reinterpret_cast<const Element*>(params.q_ptr) +
+                     int64_t(bidb) * params.q_batch_stride +
+                     int64_t(qh) * params.q_head_stride;
+    s_params.k_ptr = reinterpret_cast<const Element*>(params.k_ptr) +
+                     int64_t(kvh) * params.k_head_stride;
+    s_params.v_ptr = reinterpret_cast<const Element*>(params.v_ptr) +
+                     int64_t(kvh) * params.v_head_stride;
+    s_params.out_ptr =
+        reinterpret_cast<Element*>(params.partial_o_ptr) +
+        int64_t(bhid) * params.num_splits * params.dim +
+        int64_t(split) * params.dim;
+    s_params.lse_ptr = params.partial_lse_ptr +
+                       int64_t(bhid) * params.num_splits + split;
+    s_params.block_table =
+        params.block_table + int64_t(bidb) * params.block_table_batch_stride;
+
+    s_params.q_seqlen = 1;
+    s_params.k_seqlen = cache_len;
+    s_params.q_batch_stride = 0;
+    s_params.o_batch_stride = 0;
+    s_params.o_head_stride = 0;
+    s_params.o_row_stride = params.dim;
+    s_params.lse_batch_stride = 0;
+    s_params.lse_head_stride = 0;
+    s_params.lse_row_stride = 1;
+    s_params.n_block_min = n0;
+    s_params.n_block_max = n1;
+  }
+  __syncthreads();
+
+  flash_attention_v2_body<Kernel_traits, /*Is_causal=*/false>(
+      s_params, /*m_block=*/0, /*bidb=*/0, /*qh=*/0, /*kvh=*/0);
+}
+
+// ---------------------------------------------------------------------------
+// Combine split partials with a log-sum-exp reduction.
+// ---------------------------------------------------------------------------
+template <typename Element>
+__global__ void combine_decode_kernel(const Element* partial_o,
+                                      const float* partial_lse, Element* out,
+                                      float* out_lse, const int BH,
+                                      const int num_splits, const int D) {
+  const int bh = blockIdx.x;
+  const int d = threadIdx.x;
+  if (d >= D) return;
+
+  float m = -INFINITY;
+  for (int s = 0; s < num_splits; ++s) {
+    m = fmaxf(m, partial_lse[bh * num_splits + s]);
+  }
+  if (m == -INFINITY) {
+    out[bh * D + d] = Element(0);
+    if (d == 0) out_lse[bh] = INFINITY;
+    return;
+  }
+
+  float l = 0.f;
+  float acc = 0.f;
+  for (int s = 0; s < num_splits; ++s) {
+    const float lse = partial_lse[bh * num_splits + s];
+    if (lse == -INFINITY) continue;
+    const float w = __expf(lse - m);
+    l += w;
+    acc += w * float(partial_o[(bh * num_splits + s) * D + d]);
+  }
+  out[bh * D + d] = Element(acc / l);
+  if (d == 0) out_lse[bh] = m + __logf(l);
 }
 
 }  // namespace flash_lab

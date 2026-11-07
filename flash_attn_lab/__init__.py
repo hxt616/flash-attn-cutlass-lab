@@ -78,6 +78,7 @@ def flash_attn_with_kvcache(
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     softmax_scale: Optional[float] = None,
+    num_splits: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Paged-KV decode attention.
 
@@ -96,4 +97,5 @@ def flash_attn_with_kvcache(
         block_table,
         cache_seqlens,
         float(softmax_scale),
+        int(num_splits),
     )

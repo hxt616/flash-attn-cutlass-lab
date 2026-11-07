@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 
+#include <limits>
 #include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -89,8 +90,17 @@ void run_flash_attn_varlen_cutlass(Flash_fwd_params& params,
 
 template <typename T, int Headdim>
 void run_flash_fwd_decode_(Flash_fwd_params& params, cudaStream_t stream) {
-  flash_lab::launch_flash_fwd_decode<
-      Flash_fwd_kernel_traits<Headdim, 64, 64, 4, T>>(params, stream);
+  using Traits = Flash_fwd_kernel_traits<Headdim, 64, 64, 4, T>;
+  if (params.num_splits > 1) {
+    flash_lab::launch_flash_fwd_decode_split<Traits>(params, stream);
+    flash_lab::launch_combine_decode<T>(
+        reinterpret_cast<const T*>(params.partial_o_ptr),
+        params.partial_lse_ptr, reinterpret_cast<T*>(params.out_ptr),
+        reinterpret_cast<float*>(params.lse_ptr),
+        params.batch * params.q_head, params.num_splits, params.dim, stream);
+  } else {
+    flash_lab::launch_flash_fwd_decode<Traits>(params, stream);
+  }
 }
 
 void run_flash_attn_decode_cutlass(Flash_fwd_params& params,
@@ -267,7 +277,7 @@ std::vector<torch::Tensor> flash_attention_varlen_cutlass(
 std::vector<torch::Tensor> flash_attention_decode_cutlass(
     torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
     torch::Tensor block_table, torch::Tensor cache_seqlens,
-    double softmax_scale) {
+    double softmax_scale, int num_splits) {
   check_common(q, k_cache, v_cache);
   TORCH_CHECK(q.dim() == 4 && q.size(1) == 1,
               "decode q must be (batch, 1, head, dim)");
@@ -298,9 +308,30 @@ std::vector<torch::Tensor> flash_attention_decode_cutlass(
   const int Hk = int(k_cache.size(2));
   const int D = int(q.size(3));
   const int page_size = int(k_cache.size(1));
+  const int BH = B * H;
+
+  if (num_splits <= 0) {
+    // Small batches need more KV splits to fill the GPU; large batches already
+    // have enough (batch * head) CTAs, so use fewer splits to avoid combine
+    // overhead. Capped at 8.
+    const int target = BH < 64 ? 48 : 192;
+    num_splits = (target + BH - 1) / BH;
+    num_splits = num_splits < 1 ? 1 : num_splits;
+    num_splits = num_splits > 8 ? 8 : num_splits;
+  }
+  TORCH_CHECK(num_splits >= 1 && num_splits <= 32,
+              "num_splits must be in [1, 32]");
 
   auto out = torch::empty_like(q);
   auto lse = torch::empty({B, H, 1}, q.options().dtype(torch::kFloat32));
+  torch::Tensor partial_o;
+  torch::Tensor partial_lse;
+  if (num_splits > 1) {
+    partial_o = torch::empty({BH * num_splits, D}, q.options());
+    partial_lse = torch::full(
+        {BH * num_splits}, -std::numeric_limits<float>::infinity(),
+        q.options().dtype(torch::kFloat32));
+  }
 
   Flash_fwd_params p;
   p.q_ptr = q.data_ptr();
@@ -336,6 +367,11 @@ std::vector<torch::Tensor> flash_attention_decode_cutlass(
   p.block_table_batch_stride = int(block_table.stride(0));
   p.page_block_size = page_size;
   p.cache_seqlens = cache_seqlens.data_ptr<int>();
+  p.num_splits = num_splits;
+  if (num_splits > 1) {
+    p.partial_o_ptr = partial_o.data_ptr();
+    p.partial_lse_ptr = partial_lse.data_ptr<float>();
+  }
 
   run_flash_attn_decode_cutlass(p, stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();

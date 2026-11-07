@@ -17,5 +17,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Paged-KV decode attention (CUDA/CuTe), returns (out, lse)",
         py::arg("q"), py::arg("k_cache"), py::arg("v_cache"),
         py::arg("block_table"), py::arg("cache_seqlens"),
-        py::arg("softmax_scale") = 1.0);
+        py::arg("softmax_scale") = 1.0, py::arg("num_splits") = 0);
 }

@@ -15,4 +15,4 @@ std::vector<torch::Tensor> flash_attention_varlen_cutlass(
 std::vector<torch::Tensor> flash_attention_decode_cutlass(
     torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
     torch::Tensor block_table, torch::Tensor cache_seqlens,
-    double softmax_scale = 1.0);
+    double softmax_scale = 1.0, int num_splits = 0);

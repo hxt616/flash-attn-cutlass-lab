@@ -59,6 +59,14 @@ struct Flash_fwd_params {
   int page_block_size = 0;
   const int* cache_seqlens = nullptr;
 
+  // Decode split-KV scratch/output. When num_splits > 1, the decode kernel
+  // writes partial O/lse here and a combine kernel merges them.
+  int n_block_min = 0;
+  int n_block_max = 0;  // 0 => let the body compute the full range
+  int num_splits = 0;
+  void* partial_o_ptr = nullptr;
+  float* partial_lse_ptr = nullptr;
+
   float softmax_scale = 1.0f;
   bool is_causal = false;
   bool is_bf16 = false;

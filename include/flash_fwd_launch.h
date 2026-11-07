@@ -89,4 +89,37 @@ inline void launch_flash_fwd_decode(Flash_fwd_params& params,
   kernel<<<grid, block, smem_size, stream>>>(params);
 }
 
+template <typename Kernel_traits>
+inline void launch_flash_fwd_decode_split(Flash_fwd_params& params,
+                                          cudaStream_t stream) {
+  using Element = typename Kernel_traits::Element;
+  using SmemLayoutQ = typename Kernel_traits::SmemLayoutQ;
+  using SmemLayoutK = typename Kernel_traits::SmemLayoutKV;
+  using SmemLayoutV = typename Kernel_traits::SmemLayoutKV;
+
+  dim3 grid(params.num_splits, params.batch * params.q_head, 1);
+  dim3 block(Kernel_traits::kNThreads);
+
+  const int smem_size = static_cast<int>(
+      sizeof(SharedStorage<Element, SmemLayoutQ, SmemLayoutK, SmemLayoutV>));
+
+  auto kernel = &flash_attention_decode_split_kernel<
+      Kernel_traits, Flash_fwd_params>;
+  if (smem_size >= 48 * 1024) {
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         smem_size);
+  }
+  kernel<<<grid, block, smem_size, stream>>>(params);
+}
+
+template <typename Element>
+inline void launch_combine_decode(const Element* partial_o,
+                                  const float* partial_lse, Element* out,
+                                  float* out_lse, const int BH,
+                                  const int num_splits, const int D,
+                                  cudaStream_t stream) {
+  combine_decode_kernel<Element><<<BH, 256, 0, stream>>>(
+      partial_o, partial_lse, out, out_lse, BH, num_splits, D);
+}
+
 }  // namespace flash_lab

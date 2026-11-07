@@ -82,6 +82,32 @@ def test_decode_page_sizes(device, page_size):
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("num_splits", [1, 8])
+def test_decode_explicit_split_counts(device, num_splits):
+    B, H, Hk, D = 2, 8, 2, 64
+    cache_lens = [1, 300]
+    q, k_cache, v_cache, block_table, cache_seqlens = make_paged_inputs(
+        B, H, Hk, D, cache_lens, 256, torch.float16, device
+    )
+    out, lse = flash_attn_lab.flash_attn_with_kvcache(
+        q, k_cache, v_cache, block_table, cache_seqlens,
+        default_scale(D), num_splits=num_splits,
+    )
+    refs = []
+    lses = []
+    for b in range(B):
+        k, v = gather_kv(k_cache, v_cache, block_table[b], cache_lens[b], 256)
+        o, l = attention_ref(
+            q[b : b + 1], k.unsqueeze(0), v.unsqueeze(0), False,
+            default_scale(D), torch.float64,
+        )
+        refs.append(o)
+        lses.append(l.squeeze(0))
+    assert max_diff(out, torch.cat(refs, 0)) <= 2e-2
+    assert max_diff(lse, torch.stack(lses, 0)) <= 2e-2
+
+
+@pytest.mark.cuda
 def test_decode_rejects_bad_page_size(device):
     B, H, Hk, D = 1, 4, 4, 64
     q, k_cache, v_cache, block_table, cache_seqlens = make_paged_inputs(
