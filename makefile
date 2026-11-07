@@ -3,7 +3,7 @@ BUILD_DIR ?= build
 CUDA_ARCH ?= 89
 BENCH_ARGS ?= --dims 64,128 --seqlens 512,1024,2048 --iters 50 --warmup 10 --repeats 3 --baselines sdpa
 
-.PHONY: all build ext test bench bench-causal sanitize clean
+.PHONY: all build ext test bench bench-causal bench-decode sanitize clean
 
 all: build ext
 
@@ -24,6 +24,9 @@ bench:
 bench-causal:
 	$(PY) benchmarks/bench_fwd.py $(BENCH_ARGS) --causal --out benchmarks/results/bench_fwd_causal.csv
 	$(PY) benchmarks/plot.py benchmarks/results/bench_fwd_causal.csv
+
+bench-decode:
+	$(PY) benchmarks/bench_decode.py
 
 sanitize:
 	bash scripts/sanitize.sh

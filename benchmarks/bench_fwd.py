@@ -156,7 +156,7 @@ def main():
 
     fieldnames = list(rows[0].keys())
     with out_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     print(f"\nwrote {out_path} ({len(rows)} rows)")
