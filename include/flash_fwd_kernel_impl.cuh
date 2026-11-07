@@ -278,20 +278,16 @@ struct SharedStorage {
 };
 
 // ---------------------------------------------------------------------------
-// Forward kernel.
+// Per-(sequence, head, q-tile) body. Shared by the fixed-length kernel and the
+// fused varlen kernel.
 // ---------------------------------------------------------------------------
 template <typename Kernel_traits, bool Is_causal, typename Params>
-__global__ void flash_attention_v2_kernel(const Params params) {
+__device__ void flash_attention_v2_body(const Params& params,
+                                        const int m_block,
+                                        const int bidb,
+                                        const int qh,
+                                        const int kvh) {
   using namespace cute;
-
-  const int m_block = blockIdx.x;
-  const int bhid = blockIdx.y;
-  const int bidb = bhid / params.q_head;
-  const int qh = bhid - bidb * params.q_head;
-  const int kv_ratio = params.q_head / params.k_head;
-  const int kvh = qh / kv_ratio;
-
-  if (m_block * Kernel_traits::kBlockM >= params.q_seqlen) return;
 
   using Element = typename Kernel_traits::Element;
   using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -327,19 +323,36 @@ __global__ void flash_attention_v2_kernel(const Params params) {
   Tensor Q = make_tensor(make_gmem_ptr(q_ptr),
                          make_shape(params.q_seqlen, Int<kHeadDim>{}),
                          make_stride(params.q_row_stride, Int<1>{}));
-  Tensor K = make_tensor(make_gmem_ptr(k_ptr),
-                         make_shape(params.k_seqlen, Int<kHeadDim>{}),
-                         make_stride(params.k_row_stride, Int<1>{}));
-  Tensor V = make_tensor(make_gmem_ptr(v_ptr),
-                         make_shape(params.k_seqlen, Int<kHeadDim>{}),
-                         make_stride(params.v_row_stride, Int<1>{}));
 
   const auto tile_m = make_tile(Int<kBlockM>{}, Int<kHeadDim>{});
-  const auto tile_n = make_tile(Int<kBlockN>{}, Int<kHeadDim>{});
+
+  // A KV tile is either contiguous (block_table == nullptr) or one page of a
+  // paged KV cache. In the paged case kBlockN must divide page_block_size so a
+  // tile never crosses a page boundary.
+  auto kv_tile_ptr = [&](const Element* base, int nbi, int64_t row_stride,
+                         int64_t page_stride) -> const Element* {
+    if (params.block_table == nullptr) {
+      return base + int64_t(nbi) * kBlockN * row_stride;
+    }
+    const int logical = nbi * kBlockN;
+    const int page_idx = logical / params.page_block_size;
+    const int page_off = logical - page_idx * params.page_block_size;
+    const int physical = params.block_table[page_idx];
+    return base + int64_t(physical) * page_stride +
+           int64_t(page_off) * row_stride;
+  };
 
   Tensor gQ = local_tile(Q, tile_m, make_coord(m_block, _));
-  Tensor gK = local_tile(K, tile_n, make_coord(0, _));
-  Tensor gV = local_tile(V, tile_n, make_coord(0, _));
+  Tensor gK = make_tensor(
+      make_gmem_ptr(kv_tile_ptr(k_ptr, 0, params.k_row_stride,
+                                params.k_batch_stride)),
+      Shape<Int<kBlockN>, Int<kHeadDim>>{},
+      make_stride(params.k_row_stride, Int<1>{}));
+  Tensor gV = make_tensor(
+      make_gmem_ptr(kv_tile_ptr(v_ptr, 0, params.v_row_stride,
+                                params.v_batch_stride)),
+      Shape<Int<kBlockN>, Int<kHeadDim>>{},
+      make_stride(params.v_row_stride, Int<1>{}));
 
   TiledMMA tiled_mma;
   auto thr_mma = tiled_mma.get_slice(threadIdx.x);
@@ -361,9 +374,9 @@ __global__ void flash_attention_v2_kernel(const Params params) {
 
   Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ(_, _, 0));
   Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
-  Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK(_, _, 0));
+  Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);
   Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
-  Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
+  Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);
   Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
   // Identity tensors are used only for M/N-bound predication.
@@ -440,8 +453,12 @@ __global__ void flash_attention_v2_kernel(const Params params) {
     __syncthreads();
 
     // Load V for this KV block while the QK GEMM runs.
-    gV = local_tile(V, tile_n, make_coord(nbi, _));
-    tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
+    gV = make_tensor(
+        make_gmem_ptr(kv_tile_ptr(v_ptr, nbi, params.v_row_stride,
+                                  params.v_batch_stride)),
+        Shape<Int<kBlockN>, Int<kHeadDim>>{},
+        make_stride(params.v_row_stride, Int<1>{}));
+    tVgV = gmem_thr_copy_QKV.partition_S(gV);
     const int kv_remaining = params.k_seqlen - nbi * kBlockN;
     if (kv_remaining >= kBlockN) {
       copy_mn</*Is_even_MN=*/true, /*Clear=*/false>(
@@ -468,8 +485,12 @@ __global__ void flash_attention_v2_kernel(const Params params) {
     __syncthreads();
 
     if (nbi + 1 < n_block_max) {
-      gK = local_tile(K, tile_n, make_coord(nbi + 1, _));
-      tKgK = gmem_thr_copy_QKV.partition_S(gK(_, _, 0));
+      gK = make_tensor(
+          make_gmem_ptr(kv_tile_ptr(k_ptr, nbi + 1, params.k_row_stride,
+                                    params.k_batch_stride)),
+          Shape<Int<kBlockN>, Int<kHeadDim>>{},
+          make_stride(params.k_row_stride, Int<1>{}));
+      tKgK = gmem_thr_copy_QKV.partition_S(gK);
       const int k_next_remaining = params.k_seqlen - (nbi + 1) * kBlockN;
       if (k_next_remaining >= kBlockN) {
         copy_mn</*Is_even_MN=*/true, /*Clear=*/false>(
@@ -578,6 +599,151 @@ __global__ void flash_attention_v2_kernel(const Params params) {
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Build a device-side tile -> (sequence, m_block) map. One thread per sequence;
+// atomicAdd assigns each sequence a contiguous range of tiles. The attention
+// kernel launches with an upper-bound grid and exits extra CTAs, so the host
+// never needs to read cu_seqlens back.
+// ---------------------------------------------------------------------------
+__global__ void build_tile_map_kernel(const int* cu_q, const int* cu_k,
+                                      const int batch, const int block_m,
+                                      int* tile_seq, int* tile_m,
+                                      int* total_tiles, const int max_tiles) {
+  const int b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= batch) return;
+
+  const int qlen = cu_q[b + 1] - cu_q[b];
+  const int klen = cu_k[b + 1] - cu_k[b];
+  (void)klen;
+  const int ntiles = (qlen + block_m - 1) / block_m;
+  const int base = atomicAdd(total_tiles, ntiles);
+  if (base + ntiles > max_tiles) return;
+  for (int t = 0; t < ntiles; ++t) {
+    tile_seq[base + t] = b;
+    tile_m[base + t] = t;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-length kernel: grid = (q tiles, batch * q_head).
+// ---------------------------------------------------------------------------
+template <typename Kernel_traits, bool Is_causal, typename Params>
+__global__ void flash_attention_v2_kernel(const Params params) {
+  const int m_block = blockIdx.x;
+  const int bhid = blockIdx.y;
+  const int bidb = bhid / params.q_head;
+  const int qh = bhid - bidb * params.q_head;
+  const int kvh = qh / (params.q_head / params.k_head);
+
+  if (m_block * Kernel_traits::kBlockM >= params.q_seqlen) return;
+
+  flash_attention_v2_body<Kernel_traits, Is_causal>(params, m_block, bidb, qh,
+                                                    kvh);
+}
+
+// ---------------------------------------------------------------------------
+// Fused varlen kernel: grid = (total_q_tiles, q_head). Every sequence's Q
+// tiles live in the same grid, so the hardware scheduler can backfill idle
+// SMs across sequence boundaries. cu_seqlens and the tile->sequence map stay
+// on the device.
+// ---------------------------------------------------------------------------
+template <typename Kernel_traits, bool Is_causal, typename Params>
+__global__ void flash_attention_v2_varlen_kernel(const Params params) {
+  using Element = typename Kernel_traits::Element;
+
+  const int tile_id = blockIdx.x;
+  const int qh = blockIdx.y;
+  if (tile_id >= *params.total_q_tiles_dev) return;
+
+  const int b = params.tile_to_seq[tile_id];
+  const int m_block = params.tile_to_mblock[tile_id];
+
+  const int q_start = params.cu_seqlens_q[b];
+  const int q_end = params.cu_seqlens_q[b + 1];
+  const int k_start = params.cu_seqlens_k[b];
+  const int k_end = params.cu_seqlens_k[b + 1];
+  const int qlen = q_end - q_start;
+  const int klen = k_end - k_start;
+  if (qlen <= 0) return;
+
+  // Build the per-CTA parameter view once in shared memory instead of copying
+  // the whole Params struct per thread (which can spill to local memory).
+  __shared__ Params s_params;
+  if (threadIdx.x == 0) {
+    s_params = params;
+    s_params.q_ptr = reinterpret_cast<const Element*>(params.q_ptr) +
+                     int64_t(q_start) * params.q_row_stride;
+    s_params.k_ptr = reinterpret_cast<const Element*>(params.k_ptr) +
+                     int64_t(k_start) * params.k_row_stride;
+    s_params.v_ptr = reinterpret_cast<const Element*>(params.v_ptr) +
+                     int64_t(k_start) * params.v_row_stride;
+    s_params.out_ptr = reinterpret_cast<Element*>(params.out_ptr) +
+                       int64_t(q_start) * params.o_row_stride;
+    s_params.lse_ptr = reinterpret_cast<float*>(params.lse_ptr) +
+                       int64_t(q_start) * params.lse_row_stride;
+    s_params.q_seqlen = qlen;
+    s_params.k_seqlen = klen;
+    s_params.q_batch_stride = 0;
+    s_params.k_batch_stride = 0;
+    s_params.v_batch_stride = 0;
+    s_params.o_batch_stride = 0;
+    s_params.lse_batch_stride = 0;
+  }
+  __syncthreads();
+
+  const int kvh = qh / (params.q_head / params.k_head);
+  flash_attention_v2_body<Kernel_traits, Is_causal>(s_params, m_block, 0, qh,
+                                                    kvh);
+}
+
+// ---------------------------------------------------------------------------
+// Paged-KV decode kernel. Q has one token per sequence; K/V live in a paged
+// cache addressed by block_table. There is no causal mask because the cache
+// only contains past tokens. grid = (1, batch * q_head).
+// ---------------------------------------------------------------------------
+template <typename Kernel_traits, typename Params>
+__global__ void flash_attention_decode_kernel(const Params params) {
+  using Element = typename Kernel_traits::Element;
+
+  const int bhid = blockIdx.y;
+  const int bidb = bhid / params.q_head;
+  const int qh = bhid - bidb * params.q_head;
+  const int cache_len = params.cache_seqlens[bidb];
+  if (cache_len <= 0) return;
+
+  const int kvh = qh / (params.q_head / params.k_head);
+
+  __shared__ Params s_params;
+  if (threadIdx.x == 0) {
+    s_params = params;
+    s_params.q_ptr = reinterpret_cast<const Element*>(params.q_ptr) +
+                     int64_t(bidb) * params.q_batch_stride +
+                     int64_t(qh) * params.q_head_stride;
+    s_params.k_ptr = reinterpret_cast<const Element*>(params.k_ptr) +
+                     int64_t(kvh) * params.k_head_stride;
+    s_params.v_ptr = reinterpret_cast<const Element*>(params.v_ptr) +
+                     int64_t(kvh) * params.v_head_stride;
+    s_params.out_ptr = reinterpret_cast<Element*>(params.out_ptr) +
+                       int64_t(bidb) * params.o_batch_stride +
+                       int64_t(qh) * params.o_head_stride;
+    s_params.lse_ptr = reinterpret_cast<float*>(params.lse_ptr) +
+                       int64_t(bidb) * params.lse_batch_stride +
+                       int64_t(qh) * params.lse_head_stride;
+    s_params.block_table =
+        params.block_table + int64_t(bidb) * params.block_table_batch_stride;
+
+    s_params.q_seqlen = 1;
+    s_params.k_seqlen = cache_len;
+    s_params.q_batch_stride = 0;
+    s_params.o_batch_stride = 0;
+    s_params.lse_batch_stride = 0;
+  }
+  __syncthreads();
+
+  flash_attention_v2_body<Kernel_traits, /*Is_causal=*/false>(
+      s_params, /*m_block=*/0, /*bidb=*/0, /*qh=*/0, /*kvh=*/0);
 }
 
 }  // namespace flash_lab

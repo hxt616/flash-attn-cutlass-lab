@@ -39,6 +39,26 @@ struct Flash_fwd_params {
   int64_t lse_head_stride = 0;
   int64_t lse_row_stride = 0;
 
+  // Fused varlen metadata. All pointers are device pointers.
+  // cu_seqlens_*: int32 prefix sums, length batch + 1.
+  // tile_to_seq / tile_to_mblock: one entry per Q tile; the tile's sequence
+  // and its m_block inside that sequence.
+  const int* cu_seqlens_q = nullptr;
+  const int* cu_seqlens_k = nullptr;
+  int* tile_to_seq = nullptr;
+  int* tile_to_mblock = nullptr;
+  int* total_q_tiles_dev = nullptr;
+  int total_q_tiles = 0;  // host upper bound used as grid.x
+
+  // Paged-KV decode metadata. block_table maps a logical KV page to a
+  // physical page in k_cache/v_cache. K/V are laid out as
+  // (num_pages, page_block_size, k_head, dim); k_batch_stride is the page
+  // stride, k_row_stride is the in-page row stride.
+  const int* block_table = nullptr;
+  int block_table_batch_stride = 0;
+  int page_block_size = 0;
+  const int* cache_seqlens = nullptr;
+
   float softmax_scale = 1.0f;
   bool is_causal = false;
   bool is_bf16 = false;

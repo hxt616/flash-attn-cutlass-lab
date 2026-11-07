@@ -1,5 +1,7 @@
 #include <torch/extension.h>
 
+#include <vector>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -52,6 +54,51 @@ void run_flash_attn_cutlass(Flash_fwd_params& params, cudaStream_t stream) {
   FP16_SWITCH(!params.is_bf16, [&] {
     FWD_HEADDIM_SWITCH(params.dim, [&] {
       run_flash_fwd_<elem_type, kHeadDim>(params, stream);
+    });
+  });
+}
+
+template <typename T, int Headdim>
+void run_flash_fwd_varlen_(Flash_fwd_params& params, int total_q_tiles,
+                           cudaStream_t stream) {
+  BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+    if constexpr (Headdim == 64) {
+      if constexpr (!Is_causal) {
+        flash_lab::launch_flash_fwd_varlen<
+            Flash_fwd_kernel_traits<Headdim, 64, 128, 4, T>, Is_causal>(
+            params, total_q_tiles, stream);
+        return;
+      }
+    }
+    flash_lab::launch_flash_fwd_varlen<
+        Flash_fwd_kernel_traits<Headdim, 64, 64, 4, T>, Is_causal>(
+        params, total_q_tiles, stream);
+  });
+}
+
+void run_flash_attn_varlen_cutlass(Flash_fwd_params& params,
+                                   int total_q_tiles, cudaStream_t stream) {
+  TORCH_CHECK(params.dim <= 256, "head dim must be <= 256");
+  FP16_SWITCH(!params.is_bf16, [&] {
+    FWD_HEADDIM_SWITCH(params.dim, [&] {
+      run_flash_fwd_varlen_<elem_type, kHeadDim>(params, total_q_tiles,
+                                                 stream);
+    });
+  });
+}
+
+template <typename T, int Headdim>
+void run_flash_fwd_decode_(Flash_fwd_params& params, cudaStream_t stream) {
+  flash_lab::launch_flash_fwd_decode<
+      Flash_fwd_kernel_traits<Headdim, 64, 64, 4, T>>(params, stream);
+}
+
+void run_flash_attn_decode_cutlass(Flash_fwd_params& params,
+                                   cudaStream_t stream) {
+  TORCH_CHECK(params.dim <= 256, "head dim must be <= 256");
+  FP16_SWITCH(!params.is_bf16, [&] {
+    FWD_HEADDIM_SWITCH(params.dim, [&] {
+      run_flash_fwd_decode_<elem_type, kHeadDim>(params, stream);
     });
   });
 }
@@ -151,61 +198,146 @@ std::vector<torch::Tensor> flash_attention_varlen_cutlass(
   auto out = torch::empty_like(q);
   auto lse = torch::empty({q.size(0), H}, q.options().dtype(torch::kFloat32));
 
-  // cu_seqlens lives on the GPU; the current varlen implementation launches
-  // one kernel per sequence, so the host needs the prefix sums. This host copy
-  // is the price of the simple (non-persistent) varlen implementation.
-  auto cu_q_host = cu_seqlens_q.to(torch::kCPU);
-  auto cu_k_host = cu_seqlens_k.to(torch::kCPU);
-  auto cu_q = cu_q_host.data_ptr<int>();
-  auto cu_k = cu_k_host.data_ptr<int>();
+  TORCH_CHECK(!is_causal || q.size(0) == k.size(0),
+              "causal varlen currently requires equal total lengths");
 
-  for (int b = 0; b < batch; ++b) {
-    const int q_start = cu_q[b], q_end = cu_q[b + 1];
-    const int k_start = cu_k[b], k_end = cu_k[b + 1];
-    const int qlen = q_end - q_start;
-    const int klen = k_end - k_start;
-    TORCH_CHECK(!is_causal || qlen == klen,
-                "causal varlen currently requires seqlen_q == seqlen_k");
-    if (qlen == 0) continue;
-
-    Flash_fwd_params p;
-    p.q_ptr = static_cast<char*>(q.data_ptr()) +
-              int64_t(q_start) * H * D * q.element_size();
-    p.k_ptr = static_cast<char*>(k.data_ptr()) +
-              int64_t(k_start) * Hk * D * k.element_size();
-    p.v_ptr = static_cast<char*>(v.data_ptr()) +
-              int64_t(k_start) * Hk * D * v.element_size();
-    p.out_ptr = static_cast<char*>(out.data_ptr()) +
-                int64_t(q_start) * H * D * out.element_size();
-    p.lse_ptr = static_cast<char*>(lse.data_ptr()) +
-                int64_t(q_start) * H * lse.element_size();
-    p.batch = 1;
-    p.q_seqlen = qlen;
-    p.k_seqlen = klen;
-    p.dim = D;
-    p.q_head = H;
-    p.k_head = Hk;
-    p.q_batch_stride = 0;
-    p.q_head_stride = D;
-    p.q_row_stride = int64_t(H) * D;
-    p.k_batch_stride = 0;
-    p.k_head_stride = D;
-    p.k_row_stride = int64_t(Hk) * D;
-    p.v_batch_stride = 0;
-    p.v_head_stride = D;
-    p.v_row_stride = int64_t(Hk) * D;
-    p.o_batch_stride = 0;
-    p.o_head_stride = D;
-    p.o_row_stride = int64_t(H) * D;
-    p.lse_batch_stride = 0;
-    p.lse_head_stride = 1;
-    p.lse_row_stride = H;
-    p.softmax_scale = float(softmax_scale);
-    p.is_causal = is_causal;
-    p.is_bf16 = q.scalar_type() == at::kBFloat16;
-
-    run_flash_attn_cutlass(p, stream);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  // Build the tile -> (sequence, m_block) map on the device. No cu_seqlens
+  // device-to-host copy is needed. The host only knows an upper bound on the
+  // number of Q tiles; the attention kernel exits extra CTAs.
+  constexpr int kBlockM = 64;
+  const int max_tiles =
+      (int(q.size(0)) + kBlockM - 1) / kBlockM + batch;
+  if (max_tiles <= 0) {
+    return {out, lse};
   }
+
+  auto opts = torch::TensorOptions().dtype(torch::kInt32).device(q.device());
+  auto tile_seq_t = torch::empty({max_tiles}, opts);
+  auto tile_m_t = torch::empty({max_tiles}, opts);
+  auto total_tiles_t = torch::zeros({1}, opts);
+
+  flash_lab::launch_build_tile_map(
+      cu_seqlens_q.data_ptr<int>(), cu_seqlens_k.data_ptr<int>(), batch,
+      kBlockM, tile_seq_t.data_ptr<int>(), tile_m_t.data_ptr<int>(),
+      total_tiles_t.data_ptr<int>(), max_tiles, stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  Flash_fwd_params p;
+  p.q_ptr = q.data_ptr();
+  p.k_ptr = k.data_ptr();
+  p.v_ptr = v.data_ptr();
+  p.out_ptr = out.data_ptr();
+  p.lse_ptr = lse.data_ptr();
+  p.batch = batch;
+  p.q_seqlen = int(q.size(0));
+  p.k_seqlen = int(k.size(0));
+  p.dim = D;
+  p.q_head = H;
+  p.k_head = Hk;
+  p.q_batch_stride = 0;
+  p.q_head_stride = D;
+  p.q_row_stride = int64_t(H) * D;
+  p.k_batch_stride = 0;
+  p.k_head_stride = D;
+  p.k_row_stride = int64_t(Hk) * D;
+  p.v_batch_stride = 0;
+  p.v_head_stride = D;
+  p.v_row_stride = int64_t(Hk) * D;
+  p.o_batch_stride = 0;
+  p.o_head_stride = D;
+  p.o_row_stride = int64_t(H) * D;
+  p.lse_batch_stride = 0;
+  p.lse_head_stride = 1;
+  p.lse_row_stride = H;
+  p.softmax_scale = float(softmax_scale);
+  p.is_causal = is_causal;
+  p.is_bf16 = q.scalar_type() == at::kBFloat16;
+  p.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
+  p.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
+  p.tile_to_seq = tile_seq_t.data_ptr<int>();
+  p.tile_to_mblock = tile_m_t.data_ptr<int>();
+  p.total_q_tiles_dev = total_tiles_t.data_ptr<int>();
+  p.total_q_tiles = max_tiles;
+
+  run_flash_attn_varlen_cutlass(p, max_tiles, stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {out, lse};
+}
+
+std::vector<torch::Tensor> flash_attention_decode_cutlass(
+    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor block_table, torch::Tensor cache_seqlens,
+    double softmax_scale) {
+  check_common(q, k_cache, v_cache);
+  TORCH_CHECK(q.dim() == 4 && q.size(1) == 1,
+              "decode q must be (batch, 1, head, dim)");
+  TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4,
+              "k_cache/v_cache must be (num_pages, page_size, head, dim)");
+  TORCH_CHECK(k_cache.sizes() == v_cache.sizes(),
+              "k_cache/v_cache must have the same shape");
+  TORCH_CHECK(block_table.is_cuda() && block_table.scalar_type() == at::kInt &&
+                  block_table.dim() == 2 && block_table.is_contiguous(),
+              "block_table must be a contiguous int32 (batch, max_pages)");
+  TORCH_CHECK(cache_seqlens.is_cuda() &&
+                  cache_seqlens.scalar_type() == at::kInt &&
+                  cache_seqlens.dim() == 1 && cache_seqlens.is_contiguous(),
+              "cache_seqlens must be a contiguous int32 (batch)");
+  TORCH_CHECK(block_table.size(0) == q.size(0) &&
+                  cache_seqlens.size(0) == q.size(0),
+              "block_table/cache_seqlens batch must match q");
+  TORCH_CHECK(q.size(2) % k_cache.size(2) == 0,
+              "q head count must be a multiple of kv head count");
+  TORCH_CHECK(k_cache.size(1) % 64 == 0,
+              "page_block_size must be a multiple of 64");
+
+  const at::cuda::CUDAGuard device_guard(q.device());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  const int B = int(q.size(0));
+  const int H = int(q.size(2));
+  const int Hk = int(k_cache.size(2));
+  const int D = int(q.size(3));
+  const int page_size = int(k_cache.size(1));
+
+  auto out = torch::empty_like(q);
+  auto lse = torch::empty({B, H, 1}, q.options().dtype(torch::kFloat32));
+
+  Flash_fwd_params p;
+  p.q_ptr = q.data_ptr();
+  p.k_ptr = k_cache.data_ptr();
+  p.v_ptr = v_cache.data_ptr();
+  p.out_ptr = out.data_ptr();
+  p.lse_ptr = lse.data_ptr();
+  p.batch = B;
+  p.q_seqlen = 1;
+  p.k_seqlen = 0;
+  p.dim = D;
+  p.q_head = H;
+  p.k_head = Hk;
+  p.q_batch_stride = q.stride(0);
+  p.q_head_stride = q.stride(2);
+  p.q_row_stride = q.stride(1);
+  p.k_batch_stride = k_cache.stride(0);
+  p.k_head_stride = k_cache.stride(2);
+  p.k_row_stride = k_cache.stride(1);
+  p.v_batch_stride = v_cache.stride(0);
+  p.v_head_stride = v_cache.stride(2);
+  p.v_row_stride = v_cache.stride(1);
+  p.o_batch_stride = out.stride(0);
+  p.o_head_stride = out.stride(2);
+  p.o_row_stride = out.stride(1);
+  p.lse_batch_stride = lse.stride(0);
+  p.lse_head_stride = lse.stride(1);
+  p.lse_row_stride = lse.stride(2);
+  p.softmax_scale = float(softmax_scale);
+  p.is_causal = false;
+  p.is_bf16 = q.scalar_type() == at::kBFloat16;
+  p.block_table = block_table.data_ptr<int>();
+  p.block_table_batch_stride = int(block_table.stride(0));
+  p.page_block_size = page_size;
+  p.cache_seqlens = cache_seqlens.data_ptr<int>();
+
+  run_flash_attn_decode_cutlass(p, stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {out, lse};
 }

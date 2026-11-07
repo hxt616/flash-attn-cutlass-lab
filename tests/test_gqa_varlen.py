@@ -43,6 +43,32 @@ def test_varlen(device, causal):
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_many_short_sequences(device, causal):
+    """Many short sequences exercise the fused-varlen CTA packing."""
+    lengths = [16] * 32
+    H, Hk, D = 16, 4, 128
+    total_q = sum(lengths)
+    total_k = total_q
+    q = torch.empty((total_q, H, D), dtype=torch.bfloat16, device=device).normal_(0, 0.5)
+    k = torch.empty((total_k, Hk, D), dtype=torch.bfloat16, device=device).normal_(0, 0.5)
+    v = torch.empty((total_k, Hk, D), dtype=torch.bfloat16, device=device).normal_(0, 0.5)
+
+    cu = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(lengths), 0).tolist()),
+        dtype=torch.int32,
+        device=device,
+    )
+    scale = default_scale(D)
+    out, lse = flash_attn_lab.flash_attn_varlen_func(
+        q, k, v, cu, cu, causal, scale
+    )
+    ref, lse_ref = attention_ref_padded(q, k, v, cu, cu, causal, scale)
+    assert max_diff(out, ref) <= tolerance(torch.bfloat16)
+    assert max_diff(lse, lse_ref) <= 2e-2
+
+
+@pytest.mark.cuda
 def test_varlen_zero_length(device):
     lengths = [3, 0, 5]
     H, Hk, D = 2, 2, 64
