@@ -38,11 +38,20 @@ work can be discussed honestly in interviews.
   (`+inf` for all-masked rows).
 - Added bf16 through the CuTe atom selection, a generic fp32 fragment
   conversion, and a bf16 test path.
-- Added the varlen API. It currently loops over sequences on the host and
-  launches one kernel per sequence; correct, but not yet a fused persistent
-  kernel.
+- Added the fused varlen API. A device-side kernel builds a
+  `tile -> (sequence, m_block)` map; all sequences' Q tiles live in one grid
+  (`total_q_tiles_upper × nheads`), so the hardware scheduler backfills idle
+  SMs across sequence boundaries. No per-sequence launch and no `cu_seqlens`
+  device-to-host copy. Static fused version measures 0.96× (non-causal) /
+  0.92× (causal) official FA 2.8.3; a persistent work queue is still future
+  work.
 - Added `kBlockN` dispatch from measurements: non-causal D=64 uses 128,
   everything else uses 64.
+- Added a paged-KV decode kernel and `flash_attn_with_kvcache`-style API. K/V
+  tiles are addressed through `block_table` (no gather into a contiguous
+  buffer), with GQA and page sizes 64/128/256. The first version uses one CTA
+  per `(batch, head)` and measures 0.34–0.72× official `flash_attn_with_kvcache`;
+  split-KV + combine is the next optimization.
 
 ### PyTorch integration
 
@@ -53,8 +62,8 @@ work can be discussed honestly in interviews.
   head dim multiple of 32 and <= 256, GQA ratio integral.
 - Fixed upstream's `void*` arithmetic and `tools/utils` include-path typo;
   the extension now builds with `setup.py build_ext --inplace`.
-- varlen host prefix-sum copy (the upstream code dereferenced a device pointer
-  from host).
+- Device-side varlen tile map (no host prefix-sum copy; the upstream code
+  dereferenced a device pointer from host).
 
 ### Build and reproducibility
 
@@ -66,7 +75,7 @@ work can be discussed honestly in interviews.
 
 ### Tests and docs
 
-- 219 pytest cases: shape matrix, causal, custom scale, LSE, GQA, varlen,
+- 231 pytest cases: shape matrix, causal, custom scale, LSE, GQA, varlen,
   zero-length sequences, bf16, API rejection tests, and an
   error-vs-PyTorch criterion (`our_error <= 2 * torch_error + 1e-3`).
 - `compute-sanitizer` script for ragged shapes.
@@ -75,7 +84,11 @@ work can be discussed honestly in interviews.
 ## Not implemented (deliberately out of scope)
 
 - Backward pass, dropout, ALiBi/RoPE/window masks.
-- Paged-KV decode and a fused persistent varlen kernel.
+- Decode split-KV/combine and a decode-specific small-Q-tile schedule (the
+  current paged decode is correct but uses one CTA per head).
+- A persistent/dynamic-work-queue varlen scheduler (the current fused varlen
+  uses a static atomic tile map); prefill `block_table` / prefix-cache
+  indexing.
 - Hopper TMA/wgmma, warp specialization.
 - Multi-stage `cp.async` double buffering (the current kernel overlaps V/K
   loads but uses a single K/V buffer).

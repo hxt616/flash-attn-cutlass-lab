@@ -64,9 +64,9 @@ Symptom: host SIGSEGV inside the varlen wrapper before any kernel launched.
 Cause: `cu_seqlens_q.data_ptr<int>()` returns a device pointer, and the host
 loop read `cu_q[b]` directly.
 
-Fix: copy the prefix sums to CPU (`cu_seqlens_q.to(torch::kCPU)`) before the
-host loop. This is explicit about the cost of the current per-sequence varlen
-implementation; a fused varlen kernel would keep them on device.
+Fix: the first fix copied the prefix sums to CPU before the host loop. That
+host loop has since been replaced by a fused varlen kernel with a device-side
+tile map, so `cu_seqlens` now stays on the GPU and there is no D2H copy.
 
 ## 6. Host buffer type mismatch hid the first correctness result
 

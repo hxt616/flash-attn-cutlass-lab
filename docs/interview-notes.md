@@ -7,11 +7,13 @@ CuTe. The starting point was an MIT learning repo whose standalone 'reference'
 never actually ran softmax or PV, and whose `exp2` path forgot the `log2(e)`
 factor. I rebuilt the reference, moved the kernel into a shared header, added
 ragged-tile predication for arbitrary sequence lengths, GQA, bf16, varlen, LSE,
-and a stream-safe PyTorch extension. Then I built a 219-case pytest matrix and
-a cudaEvent benchmark harness. On an RTX 4060 Laptop the kernel is roughly at
-parity with PyTorch SDPA's flash backend, and it is faster for D=128 on several
-shapes. The main remaining bottleneck is the single-stage cp.async pipeline;
-the next step is a double-buffered K/V ring."
+and a stream-safe PyTorch extension. Then I built a 231-case pytest matrix and
+a cudaEvent benchmark harness. On an RTX 4060 Laptop the fixed-length kernel is
+at 0.93–1.06× official flash-attn 2.8.3. I also fused varlen into a single grid
+with a device-side tile map, taking it from 0.78–0.89× to 0.92–0.96×. I then
+added a paged-KV decode kernel that reads K/V directly through `block_table`;
+it is correct and currently 0.34–0.72× official because it has no split-KV yet.
+The next step is split-KV/combine and a decode-specific small-Q-tile schedule."
 
 ## Q&A
 
@@ -119,7 +121,7 @@ the host `cu_seqlens` dereference. See `docs/debugging.md`.
 ### How do you know it is correct?
 
 - An independent CUDA reference and a PyTorch materialized reference.
-- 219 pytest cases over shape/dtype/causal/GQA/varlen/edge cases.
+- 231 pytest cases over shape/dtype/causal/GQA/varlen/edge cases.
 - Official-style error bound: our error <= 2x PyTorch's fp16 error + 1e-3.
 - `compute-sanitizer` on ragged shapes.
 - LSE checked against `logsumexp`.
@@ -128,24 +130,32 @@ the host `cu_seqlens` dereference. See `docs/debugging.md`.
 ### Performance numbers and bottleneck?
 
 On RTX 4060 Laptop, fp16, B=2,H=8: about 25-29 TFLOPS non-causal, 15-26 TFLOPS
-causal depending on D/S, roughly at parity with SDPA. D=64 non-causal at S=2048
-is the weakest case (SDPA ahead). The dominant remaining limit is the
-single-stage cp.async pipeline plus causal tail imbalance. Tuning `kBlockN`
-gave a measured ~9% win for D=64 non-causal (128 vs 64) but regressed causal and
-D=128, so the dispatch is per-case.
+causal depending on D/S, roughly at parity with SDPA. A same-GPU comparison
+against official flash-attn 2.8.3, bf16 with the Qwen3-0.6B shape
+(B=1,H=16,Hk=8,D=128), gives 0.93–1.06× for fixed-length and 0.92–0.96× for
+fused varlen (mixed lengths); many short sequences are 0.86–0.88×. The
+remaining varlen gap is the static tile order / causal tail, not the old
+per-sequence launch loop. Paged-KV decode is correct but currently 0.34–0.72×
+official `flash_attn_with_kvcache`: it reads paged K/V directly, but uses one
+CTA per `(batch, head)` and a 64-row Q tile, while official uses split-KV and a
+decode-specific schedule. Tuning `kBlockN` gave a measured ~9% win for D=64
+non-causal (128 vs 64) but regressed causal and D=128, so the dispatch is
+per-case.
 
 ### Limitations to state proactively
 
 Forward only; no backward/dropout/ALiBi/window; SM80/89 only; no TMA/WGMMA;
-varlen is a host loop; contiguous inputs only; head dim multiple of 32 and
-<= 256; single-stage pipeline.
+varlen is fused but uses a static tile map; decode has `block_table` but no
+split-KV/combine and uses the 64-row prefill Q tile; prefill does not yet
+support `block_table`/prefix cache; contiguous inputs only; head dim multiple of
+32 and <= 256; single-stage cp.async pipeline.
 
 ## Resume bullets (fill measured numbers from your own machine)
 
 - Built a FlashAttention-2 forward kernel with CUTLASS CuTe on sm_89, adding
   arbitrary-length/ragged predication, causal masking, GQA/MQA, bf16, varlen,
   and LSE; packaged it as a stream-safe PyTorch extension.
-- Built a 219-case pytest matrix with an independent reference and an
+- Built a 231-case pytest matrix with an independent reference and an
   official-style error bound, plus a compute-sanitizer script; fixed upstream
   reference, `exp2` scaling, and ragged-tile OOB bugs.
 - Built a cudaEvent/CSV/plot benchmark harness against PyTorch SDPA; the kernel

@@ -123,21 +123,89 @@ is bandwidth-efficient.
 ## 7. Varlen
 
 The Python/C++ API accepts packed `(total_tokens, nheads, D)` tensors and
-`cu_seqlens_q/k`. The current implementation copies the prefix sums to the host
-and launches one kernel per sequence with `batch=1`, adjusting pointers and
-`q_seqlen/k_seqlen`. This is correct and padding-free, but it is not a fused
-persistent varlen kernel. A production version would keep `cu_seqlens` on the
-device and map CTAs to `(sequence, q-tile)` pairs, with a work queue for load
-balance.
+`cu_seqlens_q/k`. Varlen is **fused**, not a host loop:
 
-## 8. Code map
+1. A small device kernel (`build_tile_map_kernel`) runs one thread per
+   sequence. It computes `ntiles = ceil(qlen / kBlockM)` and uses `atomicAdd`
+   to reserve a range in two device arrays:
+   `tile_to_seq[t] = b`, `tile_to_mblock[t] = m_block`. The actual tile count
+   is written to a device scalar.
+2. The attention kernel launches with the upper-bound grid
+   `(ceil(total_q / kBlockM) + batch, nheads)`. A CTA whose `tile_id` is past
+   the actual count exits immediately. This avoids a device-to-host read of
+   `cu_seqlens`.
+3. Each live CTA reads its `(b, m_block)`, gets
+   `q_start/q_end/k_start/k_end` from `cu_seqlens`, builds a per-CTA params
+   view, and calls the same `flash_attention_v2_body` as the fixed-length
+   kernel.
+
+All sequences' Q tiles are in one grid, so a short sequence's CTA finishing
+early lets another sequence's CTA fill the SM. There is one launch and one
+final tail instead of one tail per sequence.
+
+### How a Q tile finds its KV tiles
+
+A Q tile never searches for K/V. Its sequence is known from `tile_to_seq`; the
+K/V pointers are offset by `k_start` and the K/V tensor shape is
+`(klen, D)`. The inner loop is simply
+
+```text
+for nbi in 0 .. n_block_max-1:
+    gK = local_tile(K, (kBlockN, D), (nbi, _))
+    gV = local_tile(V, (kBlockN, D), (nbi, _))
+```
+
+so KV tile `nbi` is at `k_start + nbi * kBlockN`; it is bounded by the
+sequence's `klen`, never another sequence's K/V. For causal self-attention,
+`n_block_max = min(ceil(klen/kBlockN), ceil((m_block+1)*kBlockM/kBlockN))`,
+so the Q tile only visits KV tiles up to its diagonal. The per-element mask
+then handles the diagonal and the ragged `klen` tail.
+
+Remaining work: the static map uses nondeterministic atomic ordering; for a
+more balanced causal tail, sort long tiles first or use a persistent
+work-queue scheduler. `block_table` / prefix-cache indexing is not implemented;
+that is required for paged prefill, and decode needs a separate paged-KV
+kernel.
+
+## 8. Paged-KV decode
+
+Decode uses Q with one token per sequence and K/V from a paged cache:
+
+```text
+q:          (B, 1, H, D)
+k_cache:    (num_pages, page_size, Hk, D)
+block_table:(B, max_pages)      # logical page -> physical page
+cache_seqlens:(B,)              # valid KV length
+```
+
+The decode kernel launches `grid = (1, B*H)` and reuses
+`flash_attention_v2_body` with `Is_causal=false` (the cache contains only past
+tokens). The body's K/V tile loader computes the physical address directly:
+
+```text
+logical   = nbi * kBlockN
+page_idx  = logical / page_block_size
+page_off  = logical % page_block_size
+physical  = block_table[b, page_idx]
+k_tile    = k_cache + physical * page_stride + page_off * row_stride
+```
+
+So there is no gather into a contiguous KV buffer. The host API checks
+`page_block_size % 64 == 0` so a 64/128-wide KV tile never crosses a page.
+
+The first version uses one CTA per `(batch, head)` and the same 64-row Q tile as
+prefill; Q row 0 is the only valid row. It reaches 0.34–0.72× official
+`flash_attn_with_kvcache` because official also split-KVs the cache across CTAs
+and uses a decode-specific schedule. Split-KV + combine is the next step.
+
+## 9. Code map
 
 | Piece | File |
 |---|---|
 | CuTe traits / layouts | `include/kernel_traits.h` |
 | Mask, predicated copy, GEMM wrappers, online softmax | `include/flash_fwd_kernel_impl.cuh` |
 | Launch (grid/smem) | `include/flash_fwd_launch.h` |
-| PyTorch API, fixed + varlen | `csrc/flash_fwd_kernel.cu` |
+| PyTorch API, fixed + varlen + decode | `csrc/flash_fwd_kernel.cu` |
 | Independent reference | `standalone/reference.cuh`, `tests/reference.py` |
 | Tests | `tests/` |
 | Benchmarks | `benchmarks/bench_fwd.py`, `benchmarks/plot.py` |

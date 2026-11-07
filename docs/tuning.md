@@ -47,12 +47,74 @@ kernel is roughly at parity with SDPA's flash backend on this laptop GPU;
 D=128 is often ahead, D=64 non-causal at S=2048 is behind. Run-to-run variance
 is about ±10% due to laptop clock behavior.
 
+## Same-GPU vs official flash-attn 2.8.3
+
+Environment: nano-vllm Python 3.12 venv (`torch 2.6.0+cu124`), official
+`flash_attn 2.8.3` editable checkout, RTX 4060 Laptop. Shape follows
+Qwen3-0.6B: `B=1, H=16, Hk=8, D=128, bf16`, `causal=True/False`.
+
+| mode | S | causal | ours ms | official ms | ours/official |
+|---|---:|---:|---:|---:|---:|
+| fixed | 512 | no | 0.0977 | 0.0957 | 0.98 |
+| fixed | 1024 | no | 0.3427 | 0.3616 | 1.06 |
+| fixed | 2048 | no | 1.1930 | 1.1606 | 0.97 |
+| varlen (fused, 512/1024/2048) | 2048 | no | 1.6156 | 1.5529 | 0.96 |
+| fixed | 512 | yes | 0.0589 | 0.0545 | 0.93 |
+| fixed | 1024 | yes | 0.1864 | 0.1748 | 0.94 |
+| fixed | 2048 | yes | 0.6618 | 0.6230 | 0.94 |
+| varlen (fused, 512/1024/2048) | 2048 | yes | 0.8941 | 0.8230 | 0.92 |
+| varlen (fused, 32 × 16) | 16 | no | 0.0522 | 0.0460 | 0.88 |
+| varlen (fused, 32 × 16) | 16 | yes | 0.0521 | 0.0447 | 0.86 |
+
+Raw data: `benchmarks/results/bench_vs_official.csv`; script:
+`benchmarks/bench_official.py`.
+
+Interpretation:
+
+- Fixed-length is at parity: 0.93–1.06× official. The implementation is
+  competitive with a production FA2 kernel on this sm89 GPU, which is a
+  stronger result than the initial "learning project" expectation.
+- Fusing varlen closed most of the old 0.78–0.89× gap: it now measures 0.92×
+  (causal) / 0.96× (non-causal) for the mixed-length case, and 0.86–0.88× for
+  many short sequences. The remaining gap is the causal tail from the static
+  tile order, not per-sequence launches anymore.
+- The kernel remains forward-only; official also provides paged-KV decode
+  (`flash_attn_with_kvcache`) which this project does not implement.
+
+## Paged-KV decode
+
+Decode is a first version: one CTA per `(batch, head)`, 64-row Q tile, K/V
+tiles addressed directly through `block_table`. It is correct but has no
+split-KV, so it does not fill the GPU when `B*H` is small.
+
+Environment: same bf16/Qwen3 shape (`H=16, Hk=8, D=128`), page size 256,
+`torch 2.6.0+cu124`, official `flash_attn 2.8.3`.
+
+| B | context | ours ms | official ms | speed |
+|---:|---:|---:|---:|---:|
+| 1 | 512 | 0.0256 | 0.0184 | 0.72× |
+| 1 | 2048 | 0.0888 | 0.0350 | 0.39× |
+| 1 | 4096 | 0.1727 | 0.0587 | 0.34× |
+| 8 | 512 | 0.1054 | 0.0552 | 0.52× |
+| 8 | 2048 | 0.3950 | 0.2102 | 0.53× |
+| 8 | 4096 | 0.6970 | 0.4050 | 0.58× |
+
+Raw data: `benchmarks/results/bench_decode.csv`; script:
+`benchmarks/bench_decode.py`.
+
+For a code-level explanation of every gap (prefill, varlen, decode), see
+[`performance-gap-analysis-zh.md`](performance-gap-analysis-zh.md).
+
+Next steps: split the KV range across CTAs, write partial O/lse, then combine
+with a log-sum-exp kernel. Also use a smaller Q tile (1/16 rows) for decode so
+the tensor-core work matches the one valid query row.
+
 ## Bottleneck hypotheses
 
 1. **Single-stage cp.async.** `cp_async_wait<0>` at the top of every KV
    iteration drains the pipeline. A 2-stage double buffer for K/V should hide
-   more of the gmem latency. This is the top next step; it is not implemented
-   here.
+   more of the gmem latency. Fixed-length is already at parity, so this is a
+   second-order optimization after the varlen scheduler work.
 2. **Causal load imbalance.** Q tiles near the top of the sequence process one
    KV block; tiles near the bottom process all of them. With a fixed CTA per Q
    tile, the tail of the grid is imbalanced. A persistent scheduler or
@@ -66,13 +128,23 @@ is about ±10% due to laptop clock behavior.
 5. **Register pressure from the fused two-GEMM accumulator.** `kBlockM=64`
    keeps the `O` accumulator and the `P` fragment live across the inner loop.
    A larger `BlockM` would increase reuse but likely spill.
+6. **Varlen static tile order / causal tail.** Fused varlen removed the
+   per-sequence launch and host copy, but the atomic tile map orders tiles
+   nondeterministically and does not prioritize long causal tiles. The measured
+   remaining gap is 4–7% for mixed lengths and 10–16% for many short sequences.
 
 ## What I would do next
 
+- **Persistent varlen scheduler / causal ordering**: the static fused grid is
+  in place; sort long causal tiles first or use a persistent work queue to
+  close the remaining 4–7% (mixed) and 10–16% (short-sequence) gap. `block_table`
+  support is also required for prefix-cache prefill.
 - Double-buffered K/V with `cp.async.commit_group` / `wait_group<1>` and a
-  circular shared-memory buffer.
+  circular shared-memory buffer. Fixed-length is already at parity, so expect
+  smaller returns here than in a typical "from scratch" kernel.
 - Persistent causal scheduler to flatten the tail.
 - Tune `(BlockM, BlockN, Warps)` per D with a compile-time dispatch table and
   autotune on the target GPU.
 - For Hopper: TMA loads + WGMMA + warp-specialized producer/consumer.
-- A fused varlen kernel with device-side `cu_seqlens` and a work queue.
+- Add `block_table` / prefix-cache indexing if the kernel is to replace
+  nano-vllm's prefill path with prefix caching enabled.

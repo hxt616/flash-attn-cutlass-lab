@@ -21,14 +21,19 @@ a PyTorch extension, a pytest matrix, benchmarks, and documentation.
   element-wise predicate handles ragged 8-row copy tiles).
 - Causal and non-causal masks; the causal path skips fully-masked KV blocks.
 - GQA / MQA (`nheads_k < nheads`) with correct KV-head mapping.
-- Variable-length attention (`cu_seqlens`) without padding. The varlen path
-  currently launches one kernel per sequence; it is correct but not a single
-  fused persistent kernel.
+- Variable-length attention (`cu_seqlens`) without padding. Varlen now uses a
+  single fused kernel: a small device-side kernel builds a `tile -> (sequence,
+  m_block)` map, and all sequences' Q tiles share one grid. No per-sequence
+  launch and no `cu_seqlens` device-to-host copy.
+- Paged-KV decode: `flash_attn_with_kvcache`-style API with `block_table`,
+  `cache_seqlens`, GQA and page sizes 64/128/256. The kernel reads K/V tiles
+  directly from paged cache (no gather into a contiguous buffer).
 - PyTorch extension that launches on the current CUDA stream, returns
   `(out, lse)`, and validates dtype/shape/contiguity.
-- 219 pytest cases (shapes, causal, GQA, varlen, bf16, edge cases, API
-  contracts, and an official-style error-vs-PyTorch criterion).
-- Reproducible benchmark harness with CSV/PNG output and SDPA comparison.
+- 231 pytest cases (shapes, causal, GQA, varlen, decode/paged KV, bf16, edge
+  cases, API contracts, and an official-style error-vs-PyTorch criterion).
+- Reproducible benchmark harness with CSV/PNG output and SDPA/official
+  comparisons.
 
 ## Repo layout
 
@@ -39,14 +44,14 @@ include/
   flash_params.h              # shared launch parameters
   kernel_traits.h, utils.h    # upstream-derived CuTe helpers
 csrc/
-  flash_fwd_kernel.cu         # PyTorch host wrapper (fixed + varlen)
+  flash_fwd_kernel.cu         # PyTorch host wrapper (fixed + varlen + decode)
   flash_api.cpp               # pybind11 module
   static_switch.h
 standalone/
   main.cu                     # correctness vs naive + cudaEvent benchmark
   reference.cuh               # simple, auditable reference kernel
-tests/                        # pytest matrix + fp64/fp32 reference
-benchmarks/                   # bench_fwd.py, plot.py, results/
+tests/                        # pytest matrix + fp64/fp32 reference (incl. decode)
+benchmarks/                   # bench_fwd.py, bench_official.py, bench_decode.py, results/
 docs/                         # design, tuning, debugging, interview notes
 ```
 
@@ -79,20 +84,28 @@ Standalone quick checks:
 ./build/flash_attn_lab --B 1 --H 2 --Hk 2 --S 129 --D 128 --causal --no-bench
 ```
 
-Python API (also available as `flash_attn_lab.flash_attn_func`):
+Python API (also available as `flash_attn_lab.*`):
 
 ```python
-from flash_attn_lab import flash_attn_func, flash_attn_varlen_func
+from flash_attn_lab import (
+    flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache,
+)
 
 out, lse = flash_attn_func(q, k, v, causal=True)   # q: (B,S,H,D)
 out, lse = flash_attn_varlen_func(q, k, v, cu_q, cu_k, causal=True)
+
+# paged-KV decode: q (B,1,H,D), cache (num_pages,page_size,Hk,D)
+out, lse = flash_attn_with_kvcache(
+    q, k_cache, v_cache, block_table, cache_seqlens
+)
 ```
 
 `q` is `(batch, seqlen, nheads, headdim)`; `k/v` are
 `(batch, seqlen_k, nheads_k, headdim)`; inputs must be contiguous
 `fp16`/`bf16`. `lse` is `float32` with shape `(batch, nheads, seqlen_q)`.
 Varlen inputs are `(total_tokens, nheads, headdim)` and `lse` is
-`(total_tokens, nheads)`.
+`(total_tokens, nheads)`. Decode `block_table` is `(batch, max_pages)` int32
+and `cache_seqlens` is `(batch,)` int32.
 
 ## Correctness
 
@@ -109,7 +122,7 @@ Reference: an independent, easy-to-audit CUDA kernel
 - official-style check: `our_error <= 2 * pytorch_error + 1e-3`
 
 ```text
-219 passed
+231 passed
 ```
 
 Run `make sanitize` to exercise small ragged shapes under
@@ -126,28 +139,70 @@ warmup iterations; PyTorch SDPA is the baseline. Laptop GPUs throttle, so treat
 
 | D | S | this kernel | SDPA |
 |---:|---:|---:|---:|
-| 64 | 512 | 20.8 | 21.8 |
-| 64 | 1024 | 24.3 | 23.7 |
-| 64 | 2048 | 25.2 | 29.7 |
-| 128 | 512 | 24.8 | 24.9 |
-| 128 | 1024 | 28.5 | 26.3 |
-| 128 | 2048 | 29.3 | 29.1 |
+| 64 | 512 | 19.6 | 21.8 |
+| 64 | 1024 | 22.8 | 23.7 |
+| 64 | 2048 | 23.5 | 29.7 |
+| 128 | 512 | 24.6 | 25.1 |
+| 128 | 1024 | 28.1 | 26.4 |
+| 128 | 2048 | 28.7 | 29.1 |
 
 **Causal (TFLOPS)**
 
 | D | S | this kernel | SDPA |
 |---:|---:|---:|---:|
-| 64 | 512 | 15.3 | 14.2 |
-| 64 | 1024 | 19.8 | 18.2 |
-| 64 | 2048 | 22.9 | 23.3 |
-| 128 | 512 | 18.3 | 18.9 |
-| 128 | 1024 | 23.0 | 23.6 |
-| 128 | 2048 | 26.5 | 27.3 |
+| 64 | 512 | 14.8 | 14.1 |
+| 64 | 1024 | 19.4 | 18.2 |
+| 64 | 2048 | 22.4 | 22.1 |
+| 128 | 512 | 18.4 | 19.7 |
+| 128 | 1024 | 23.3 | 24.5 |
+| 128 | 2048 | 26.1 | 27.4 |
 
 The kernel is competitive with SDPA's flash backend on this laptop GPU; D=128
 is often ahead because the extra K-dimension work amortizes the non-matmul
 softmax overhead. See [`docs/tuning.md`](docs/tuning.md) for the block-N
-experiment and bottleneck analysis.
+experiment and bottleneck analysis, and
+[`docs/performance-gap-analysis-zh.md`](docs/performance-gap-analysis-zh.md)
+for a detailed explanation of every performance gap (prefill/varlen/decode).
+
+**vs official flash-attn 2.8.3** (same GPU, bf16, Qwen3-0.6B shape:
+`B=1, H=16, Hk=8, D=128`; ratio = our TFLOPS / official TFLOPS)
+
+| mode | S | causal | ratio |
+|---|---:|---:|---:|
+| fixed | 512 | no | 0.98 |
+| fixed | 1024 | no | 1.06 |
+| fixed | 2048 | no | 0.97 |
+| varlen (fused) | 512/1024/2048 | no | 0.96 |
+| fixed | 512 | yes | 0.93 |
+| fixed | 1024 | yes | 0.94 |
+| fixed | 2048 | yes | 0.94 |
+| varlen (fused) | 512/1024/2048 | yes | 0.92 |
+
+Max output difference vs official is ~1e-3 in bf16. Fixed-length and fused
+varlen are now both essentially at parity (0.92–1.06×). Many short sequences
+(`32 × 16`) land at 0.88 (non-causal) / 0.86 (causal); the remaining gap is the
+causal tail and the static tile order. The official baseline runs in the
+nano-vllm Python 3.12 environment (`torch 2.6.0+cu124`, official
+`flash_attn 2.8.3`). Raw data:
+`benchmarks/results/bench_vs_official.csv`.
+
+**Paged-KV decode** (bf16, `H=16, Hk=8, D=128`, page size 256, no split-KV)
+
+| B | context | ours ms | official ms | speed vs official |
+|---:|---:|---:|---:|---:|
+| 1 | 512 | 0.0256 | 0.0184 | 0.72× |
+| 1 | 2048 | 0.0888 | 0.0350 | 0.39× |
+| 1 | 4096 | 0.1727 | 0.0587 | 0.34× |
+| 8 | 512 | 0.1054 | 0.0552 | 0.52× |
+| 8 | 2048 | 0.3950 | 0.2102 | 0.53× |
+| 8 | 4096 | 0.6970 | 0.4050 | 0.58× |
+
+Correctness matches official within ~1e-3. This is a **first paged-decode
+version**: K/V are read directly through `block_table`, but it uses one CTA per
+`(batch, head)` and the same 64-row Q tile as prefill. Official uses split-KV
+and a decode-specific schedule, so our latency is 0.34–0.72× official. Split-KV
++ combine is the next optimization; raw data:
+`benchmarks/results/bench_decode.csv`.
 
 ## What I changed vs upstream
 
@@ -157,22 +212,27 @@ See [`CONTRIBUTIONS.md`](CONTRIBUTIONS.md). Highlights:
   extension with stream-safe launch and input validation.
 - Fixed the standalone reference (it never executed softmax/PV) and the
   `exp2` scale (missing `log2(e)`).
-- Added ragged-tile predication, arbitrary sequence lengths, GQA, bf16, varlen,
-  and LSE.
+- Added ragged-tile predication, arbitrary sequence lengths, GQA, bf16, fused
+  varlen (device-side tile map), and LSE.
 - Added the pytest matrix, sanitizer script, benchmark harness, and docs.
 - Tuned `kBlockN` per dtype/head-dim/causal case (measured, not guessed).
 
 ## Known limitations
 
-- Forward only; no backward, dropout, ALiBi/RoPE/window, paged-KV decode.
+- Forward only; no backward, dropout, ALiBi/RoPE/window.
 - SM80/SM89 path only; no Hopper TMA/wgmma or warp specialization.
-- Varlen is a host loop over sequences, not one fused persistent kernel.
+- Varlen uses a static fused grid with an atomic device-side tile map; a
+  persistent work-queue scheduler would further reduce the causal tail.
+- Decode is a first paged-KV version: no split-KV/combine yet, and it uses the
+  64-row prefill Q tile; this is why decode is 0.34–0.72× official.
+- Prefill does not yet support `block_table`/prefix-cache indexing; only the
+  no-prefix-cache prefill path is supported. Decode does support `block_table`.
 - Single-stage `cp.async` pipeline (K/V loads overlap the QK GEMM, but there is
   no multi-stage ring buffer yet).
 - Only contiguous inputs; head dim must be a multiple of 32 and ≤ 256.
-- The official `flash-attn` package was not importable in this Python 3.10
-  environment, so SDPA is the reported baseline. The benchmark script will add
-  official FA automatically when it is installed.
+- The official comparison uses a separate Python 3.12 environment because the
+  project's dev venv is Python 3.10; the kernel sources are identical. See
+  `benchmarks/bench_official.py`.
 
 ## License
 
