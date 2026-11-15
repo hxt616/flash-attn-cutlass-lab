@@ -1,17 +1,31 @@
 # flash-attn-cutlass-lab
 
-A from-scratch-in-spirit FlashAttention-2 **forward** kernel built with
-[CUTLASS CuTe](https://github.com/NVIDIA/cutlass), packaged with a reproducible
-correctness and performance harness. It is my rework of the excellent
+An AI-assisted rework of the FlashAttention-2 forward/decode kernels, built
+with [CUTLASS CuTe](https://github.com/NVIDIA/cutlass) and packaged with a
+reproducible correctness and performance harness. It is based on the excellent
 [tiny-flash-attention](https://github.com/66RING/tiny-flash-attention) learning
 repo: the upstream project supplies the CuTe skeleton and tutorials, while this
 repository adds correctness fixes, arbitrary-length/varlen support, GQA,
-a PyTorch extension, a pytest matrix, benchmarks, and documentation.
+paged-KV decode, a PyTorch extension, a pytest matrix, benchmarks, and
+documentation.
 
 > Attribution: see [`NOTICE`](NOTICE). Upstream is MIT; CUTLASS and the
 > FlashAttention algorithm/reference patterns are BSD-3. Files derived from
 > upstream keep their copyright notice. This is not a claim of original
 > authorship over the upstream skeleton.
+
+## Development notes
+
+This project was developed with AI coding assistants. AI assistants contributed
+to the kernel implementation, host wrappers, tests, benchmarks, and
+documentation. The author set the project direction and technical scope, and is
+responsible for the final validation and the reported results. The repository
+was built, tested, and benchmarked in the environment described below; all
+numbers can be reproduced from the provided scripts.
+
+This disclosure is intentional: the project is a learning and engineering
+exercise built on an upstream MIT skeleton, not a claim that every line was
+written manually from scratch.
 
 ## Features
 

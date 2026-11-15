@@ -6,6 +6,11 @@ The upstream project provides the CuTe FlashAttention-2 learning kernel and
 tutorials. The list below separates upstream material from my changes so the
 work can be discussed honestly in interviews.
 
+> Development note: AI coding assistants were used during implementation,
+> testing, benchmarking, and documentation. The author set the project
+> direction and scope and is responsible for final validation and the reported
+> results. See the "Development notes" section in `README.md`.
+
 ## Upstream material (kept, with attribution)
 
 - `include/kernel_traits.h`, `include/utils.h`
