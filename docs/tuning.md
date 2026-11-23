@@ -1,5 +1,7 @@
 # Tuning notes
 
+[English](tuning.md) | [简体中文](tuning_zh.md)
+
 ## Methodology
 
 - Isolate the kernel with the standalone binary (no Python allocation):
@@ -102,8 +104,8 @@ Environment: same bf16/Qwen3 shape (`H=16, Hk=8, D=128`), page size 256,
 Raw data: `benchmarks/results/bench_decode.csv`; script:
 `benchmarks/bench_decode.py`.
 
-For a code-level explanation of every gap (prefill, varlen, decode), see
-[`performance-gap-analysis-zh.md`](performance-gap-analysis-zh.md).
+For a code-level explanation of prefill/varlen/decode, see
+[`design.md`](design.md) / [`design_zh.md`](design_zh.md).
 
 Remaining decode work: a smaller Q tile (1/16 rows) so tensor-core work matches
 the one valid query row, a multi-stage `cp.async` pipeline, and possibly sharing

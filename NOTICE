@@ -7,16 +7,17 @@ tiny-flash-attention
   Copyright (c) 2024 66RING
   MIT License
   https://github.com/66RING/tiny-flash-attention
-  The CuTe FlashAttention-2 skeleton, kernel_traits.h, utils.h, and the
-  tutorial documents in docs/ originate from this project.
+  The CuTe FlashAttention-2 skeleton, kernel_traits.h, and utils.h originate
+  from this project. Upstream tutorial documents are kept outside the public
+  repository for personal study.
 
 CUTLASS / CuTe
 --------------
 Copyright (c) 2017-2024 NVIDIA Corporation
 BSD 3-Clause License
 https://github.com/NVIDIA/cutlass
-  Used as a pinned submodule/checkout (v3.4.x) for CuTe layouts, MMA atoms,
-  copy atoms, and the SM80 pipeline primitives.
+  Used as vendored v3.4.x headers for CuTe layouts, MMA atoms, copy atoms, and
+  the SM80 pipeline primitives.
 
 FlashAttention
 --------------

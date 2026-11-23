@@ -1,5 +1,7 @@
 # Design notes
 
+[English](design.md) | [简体中文](design_zh.md)
+
 ## 1. What FlashAttention computes
 
 For one head, with `Q, K, V` of shape `(S, D)`:
@@ -223,5 +225,4 @@ next decode optimizations.
 | Independent reference | `standalone/reference.cuh`, `tests/reference.py` |
 | Tests | `tests/` |
 | Benchmarks | `benchmarks/bench_fwd.py`, `benchmarks/plot.py` |
-| Tuning/debug stories | `docs/tuning.md`, `docs/debugging.md` |
-| Interview Q&A | `docs/interview-notes.md` |
+| Tuning notes | `docs/tuning.md`, `docs/tuning_zh.md` |

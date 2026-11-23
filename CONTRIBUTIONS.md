@@ -15,8 +15,10 @@ work can be discussed honestly in interviews.
 
 - `include/kernel_traits.h`, `include/utils.h`
 - The overall QK -> online-softmax -> PV CuTe structure
-- `docs/cutlass_cute_tutorial_{en,zh}.md`
 - The original parameter structs and the idea of a standalone + pybind build
+
+Upstream tutorial documents are kept outside the public repository for
+personal study.
 
 ## My changes
 
@@ -84,7 +86,8 @@ work can be discussed honestly in interviews.
   zero-length sequences, bf16, API rejection tests, and an
   error-vs-PyTorch criterion (`our_error <= 2 * torch_error + 1e-3`).
 - `compute-sanitizer` script for ragged shapes.
-- Design, tuning, debugging, and interview notes under `docs/`.
+- Public design/tuning docs under `docs/`; personal debugging/interview/
+  performance notes are kept outside the public repository.
 
 ## Not implemented (deliberately out of scope)
 

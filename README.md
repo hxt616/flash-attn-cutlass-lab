@@ -1,5 +1,7 @@
 # flash-attn-cutlass-lab
 
+[English](README.md) | [简体中文](README_zh.md)
+
 An AI-assisted rework of the FlashAttention-2 forward/decode kernels, built
 with [CUTLASS CuTe](https://github.com/NVIDIA/cutlass) and packaged with a
 reproducible correctness and performance harness. It is based on the excellent
@@ -66,7 +68,7 @@ standalone/
   reference.cuh               # simple, auditable reference kernel
 tests/                        # pytest matrix + fp64/fp32 reference (incl. decode)
 benchmarks/                   # bench_fwd.py, bench_official.py, bench_decode.py, results/
-docs/                         # design, tuning, debugging, interview notes
+docs/                         # public design/tuning docs (English + Chinese)
 ```
 
 ## Quick start
@@ -173,10 +175,11 @@ warmup iterations; PyTorch SDPA is the baseline. Laptop GPUs throttle, so treat
 
 The kernel is competitive with SDPA's flash backend on this laptop GPU; D=128
 is often ahead because the extra K-dimension work amortizes the non-matmul
-softmax overhead. See [`docs/tuning.md`](docs/tuning.md) for the block-N
-experiment and bottleneck analysis, and
-[`docs/performance-gap-analysis-zh.md`](docs/performance-gap-analysis-zh.md)
-for a detailed explanation of every performance gap (prefill/varlen/decode).
+softmax overhead. See [`docs/tuning.md`](docs/tuning.md) /
+[`docs/tuning_zh.md`](docs/tuning_zh.md) for the block-N experiment, and
+[`docs/design.md`](docs/design.md) / [`docs/design_zh.md`](docs/design_zh.md)
+for the design. Detailed personal learning notes (debugging/interview/performance
+analysis) are kept outside the public repository.
 
 **vs official flash-attn 2.8.3** (same GPU, bf16, Qwen3-0.6B shape:
 `B=1, H=16, Hk=8, D=128`; ratio = our TFLOPS / official TFLOPS)
